@@ -1,6 +1,16 @@
 import express from 'express';
 import path from 'path';
+import crypto from 'crypto';
+import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
+
+interface User {
+  id: string;
+  fullName: string;
+  email: string;
+  passwordHash?: string;
+  createdAt: number;
+}
 
 interface Room {
   id: string;
@@ -16,8 +26,14 @@ interface Room {
   updatedAt: number;
 }
 
+const users = new Map<string, User>();
 const rooms = new Map<string, Room>();
 const sseClients = new Map<string, express.Response[]>();
+
+// Hash password helper
+function hashPassword(password: string): string {
+  return crypto.createHash('sha256').update(password + '_jat_maomo_salt').digest('hex');
+}
 
 // Cleanup stale rooms (older than 30 minutes)
 setInterval(() => {
@@ -37,7 +53,7 @@ function broadcastToRoom(roomId: string, eventType: string, data: any) {
     try {
       res.write(payload);
     } catch {
-      // ignore
+      // ignore client error
     }
   }
 }
@@ -50,8 +66,119 @@ async function startServer() {
 
   // API Health check
   app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', activeRooms: rooms.size });
+    res.json({
+      status: 'ok',
+      usersCount: users.size,
+      activeRooms: rooms.size,
+      serverTime: Date.now(),
+    });
   });
+
+  // ===================== AUTHENTICATION ENDPOINTS =====================
+
+  // Sign Up
+  app.post('/api/auth/signup', (req, res) => {
+    const { fullName, email, password } = req.body;
+    if (!fullName || !email || !password) {
+      return res.status(400).json({ error: 'Please provide full name, email, and password.' });
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    if (users.has(cleanEmail)) {
+      return res.status(400).json({ error: 'An account with this email already exists. Please log in.' });
+    }
+
+    const newUser: User = {
+      id: 'usr_' + Math.random().toString(36).substring(2, 11),
+      fullName: String(fullName).trim(),
+      email: cleanEmail,
+      passwordHash: hashPassword(String(password)),
+      createdAt: Date.now(),
+    };
+
+    users.set(cleanEmail, newUser);
+
+    res.json({
+      success: true,
+      user: {
+        uid: newUser.id,
+        fullName: newUser.fullName,
+        email: newUser.email,
+        createdAt: newUser.createdAt,
+      },
+    });
+  });
+
+  // Log In
+  app.post('/api/auth/login', (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Please enter both email and password.' });
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const existingUser = users.get(cleanEmail);
+
+    if (!existingUser) {
+      // Create user on-the-fly if not found to provide a friction-free experience
+      const newUser: User = {
+        id: 'usr_' + Math.random().toString(36).substring(2, 11),
+        fullName: cleanEmail.split('@')[0] || 'User',
+        email: cleanEmail,
+        passwordHash: hashPassword(String(password)),
+        createdAt: Date.now(),
+      };
+      users.set(cleanEmail, newUser);
+      return res.json({
+        success: true,
+        user: {
+          uid: newUser.id,
+          fullName: newUser.fullName,
+          email: newUser.email,
+          createdAt: newUser.createdAt,
+        },
+      });
+    }
+
+    if (existingUser.passwordHash && existingUser.passwordHash !== hashPassword(String(password))) {
+      return res.status(401).json({ error: 'Incorrect password. Please verify and try again.' });
+    }
+
+    res.json({
+      success: true,
+      user: {
+        uid: existingUser.id,
+        fullName: existingUser.fullName,
+        email: existingUser.email,
+        createdAt: existingUser.createdAt,
+      },
+    });
+  });
+
+  // Quick Start / Guest Login
+  app.post('/api/auth/guest', (req, res) => {
+    const { name } = req.body;
+    const guestId = 'guest_' + Math.random().toString(36).substring(2, 10);
+    const guestUser: User = {
+      id: guestId,
+      fullName: name?.trim() || 'Home User',
+      email: `${guestId}@jatmaomo.local`,
+      createdAt: Date.now(),
+    };
+    users.set(guestUser.email, guestUser);
+
+    res.json({
+      success: true,
+      user: {
+        uid: guestUser.id,
+        fullName: guestUser.fullName,
+        email: guestUser.email,
+        createdAt: guestUser.createdAt,
+      },
+    });
+  });
+
+  // ===================== ROOM & LIVE STREAMING ENDPOINTS =====================
 
   // Create Room (Controller Mode)
   app.post('/api/rooms/create', (req, res) => {
@@ -63,7 +190,7 @@ async function startServer() {
     const newRoom: Room = {
       id,
       controllerId: controllerId || 'anonymous',
-      controllerName: controllerName || 'Controller Device',
+      controllerName: controllerName || 'Controller Phone',
       offer,
       controllerCandidates: [],
       monitorCandidates: [],
@@ -125,16 +252,18 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  // Frame relay sync
+  // High-performance Frame Relay Sync
   app.post('/api/rooms/:id/frame', (req, res) => {
     const room = rooms.get(req.params.id);
     if (!room) {
       return res.status(404).json({ error: 'Room not found' });
     }
     const { frame } = req.body;
-    room.lastFrame = frame;
-    room.updatedAt = Date.now();
-    broadcastToRoom(room.id, 'frame', { frame });
+    if (frame) {
+      room.lastFrame = frame;
+      room.updatedAt = Date.now();
+      broadcastToRoom(room.id, 'frame', { frame });
+    }
     res.json({ success: true });
   });
 
@@ -151,7 +280,7 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  // Server-Sent Events (SSE) stream for instant real-time room signaling
+  // Server-Sent Events (SSE) stream for instant real-time room signaling & frames
   app.get('/api/rooms/:id/stream', (req, res) => {
     const roomId = req.params.id;
     const room = rooms.get(roomId);
@@ -172,7 +301,17 @@ async function startServer() {
       res.write(`event: init\ndata: ${JSON.stringify(room)}\n\n`);
     }
 
+    // Keepalive ping every 15s to prevent timeouts
+    const pingInterval = setInterval(() => {
+      try {
+        res.write(':keepalive\n\n');
+      } catch {
+        clearInterval(pingInterval);
+      }
+    }, 15000);
+
     req.on('close', () => {
+      clearInterval(pingInterval);
       const clients = sseClients.get(roomId) || [];
       const idx = clients.indexOf(res);
       if (idx !== -1) {

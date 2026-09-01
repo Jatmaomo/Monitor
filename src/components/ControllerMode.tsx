@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { UserProfile } from '../types';
 import { rtcConfiguration, generateRoomCode } from '../lib/webrtc';
 import { signaling } from '../lib/signaling';
+import { createVirtualCCTVStream } from '../lib/virtualCamera';
 import {
   Camera,
   Video,
@@ -10,11 +11,13 @@ import {
   Copy,
   Check,
   AlertCircle,
-  Radio,
   Share2,
   Shield,
   Wifi,
   Eye,
+  ExternalLink,
+  Sparkles,
+  HelpCircle,
 } from 'lucide-react';
 
 interface ControllerModeProps {
@@ -23,16 +26,19 @@ interface ControllerModeProps {
 
 export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
   const [isCameraActive, setIsCameraActive] = useState(false);
+  const [isVirtualMode, setIsVirtualMode] = useState(false);
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
   const [roomCode, setRoomCode] = useState<string | null>(null);
   const [isMonitorConnected, setIsMonitorConnected] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isPermissionDenied, setIsPermissionDenied] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const virtualCleanupRef = useRef<(() => void) | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const currentRoomCodeRef = useRef<string | null>(null);
   const frameIntervalRef = useRef<any>(null);
@@ -44,6 +50,11 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
     if (frameIntervalRef.current) {
       clearInterval(frameIntervalRef.current);
       frameIntervalRef.current = null;
+    }
+
+    if (virtualCleanupRef.current) {
+      virtualCleanupRef.current();
+      virtualCleanupRef.current = null;
     }
 
     if (currentRoomCodeRef.current) {
@@ -84,6 +95,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
     isRemoteDescriptionSetRef.current = false;
     candidateQueueRef.current = [];
     setIsCameraActive(false);
+    setIsVirtualMode(false);
     setIsMonitorConnected(false);
     setRoomCode(null);
   }, []);
@@ -98,7 +110,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
   // Robust multi-fallback helper to acquire camera stream
   const getCameraMediaStream = async (targetFacing: 'environment' | 'user'): Promise<MediaStream> => {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      throw new Error('Camera API (getUserMedia) is not supported in this browser. Please open in Chrome or Safari.');
+      throw new Error('Camera API (getUserMedia) is not supported in this browser. Please open in Chrome, Edge, or Safari.');
     }
 
     // Constraint attempt 1: Facing mode + 720p ideal
@@ -149,161 +161,174 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
     }
   };
 
+  // Core stream initialization shared between real camera and virtual CCTV stream
+  const initializeBroadcasting = async (stream: MediaStream, isVirtual: boolean) => {
+    streamRef.current = stream;
+
+    // Attach stream to local preview video element
+    if (videoRef.current) {
+      videoRef.current.srcObject = stream;
+      try {
+        await videoRef.current.play();
+      } catch (playErr) {
+        console.warn('Video auto-play note:', playErr);
+      }
+    }
+
+    // Generate a 6-digit room code
+    const newRoomCode = generateRoomCode();
+    setRoomCode(newRoomCode);
+    currentRoomCodeRef.current = newRoomCode;
+
+    // Create WebRTC Peer Connection
+    const pc = new RTCPeerConnection(rtcConfiguration);
+    peerConnectionRef.current = pc;
+
+    // Add local video track to WebRTC
+    stream.getTracks().forEach((track) => {
+      pc.addTrack(track, stream);
+    });
+
+    // Handle ICE Candidates from Controller
+    pc.onicecandidate = async (event) => {
+      if (event.candidate && currentRoomCodeRef.current) {
+        try {
+          await signaling.sendCandidate(
+            currentRoomCodeRef.current,
+            'controller',
+            event.candidate.toJSON()
+          );
+        } catch (err) {
+          console.warn('Error saving controller candidate:', err);
+        }
+      }
+    };
+
+    // Track connection state
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        setIsMonitorConnected(true);
+      } else if (
+        pc.connectionState === 'disconnected' ||
+        pc.connectionState === 'failed' ||
+        pc.connectionState === 'closed'
+      ) {
+        setIsMonitorConnected(false);
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        setIsMonitorConnected(true);
+      } else if (
+        pc.iceConnectionState === 'disconnected' ||
+        pc.iceConnectionState === 'failed'
+      ) {
+        setIsMonitorConnected(false);
+      }
+    };
+
+    // Create WebRTC Offer
+    const offer = await pc.createOffer({
+      offerToReceiveAudio: false,
+      offerToReceiveVideo: false,
+    });
+    await pc.setLocalDescription(offer);
+
+    const initialFrame = captureFrame();
+
+    // Store room and offer in Backend Server
+    await signaling.createRoom(
+      newRoomCode,
+      user.uid,
+      user.fullName || (isVirtual ? 'Virtual CCTV Camera' : 'Home Camera'),
+      {
+        type: offer.type,
+        sdp: offer.sdp,
+      },
+      initialFrame
+    );
+
+    // Listen for Monitor's WebRTC Answer & Candidates via SSE
+    signaling.subscribeToRoom(newRoomCode, {
+      onAnswer: async (data) => {
+        if (data?.answer && !isRemoteDescriptionSetRef.current && pc.signalingState !== 'stable') {
+          try {
+            const answer = new RTCSessionDescription(data.answer);
+            await pc.setRemoteDescription(answer);
+            isRemoteDescriptionSetRef.current = true;
+            setIsMonitorConnected(true);
+
+            // Flush queued candidates
+            while (candidateQueueRef.current.length > 0) {
+              const cand = candidateQueueRef.current.shift();
+              if (cand) {
+                try {
+                  await pc.addIceCandidate(new RTCIceCandidate(cand));
+                } catch (e) {
+                  console.warn('Error adding queued candidate:', e);
+                }
+              }
+            }
+          } catch (err) {
+            console.error('Error setting remote description from answer:', err);
+          }
+        }
+      },
+      onMonitorCandidate: async (candidateData) => {
+        if (isRemoteDescriptionSetRef.current && pc.remoteDescription) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(candidateData));
+          } catch (err) {
+            console.warn('Error adding monitor candidate:', err);
+          }
+        } else {
+          candidateQueueRef.current.push(candidateData);
+        }
+      },
+    });
+
+    // Frame relay sync (every 600ms updates lightweight frame snapshot to ensure feed never drops)
+    frameIntervalRef.current = setInterval(async () => {
+      if (currentRoomCodeRef.current) {
+        const frame = captureFrame();
+        if (frame) {
+          signaling.sendFrame(currentRoomCodeRef.current, frame);
+        }
+      }
+    }, 600);
+
+    setIsVirtualMode(isVirtual);
+    setIsCameraActive(true);
+  };
+
   const startCamera = async () => {
     setErrorMessage(null);
+    setIsPermissionDenied(false);
     setIsStarting(true);
     isRemoteDescriptionSetRef.current = false;
     candidateQueueRef.current = [];
 
     try {
-      // 1. Acquire media stream from camera
       const stream = await getCameraMediaStream(facingMode);
-      streamRef.current = stream;
-
-      // Attach stream to local preview video element
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        try {
-          await videoRef.current.play();
-        } catch (playErr) {
-          console.warn('Video auto-play note:', playErr);
-        }
-      }
-
-      // 2. Generate a 6-digit room code
-      const newRoomCode = generateRoomCode();
-      setRoomCode(newRoomCode);
-      currentRoomCodeRef.current = newRoomCode;
-
-      // 3. Create WebRTC Peer Connection
-      const pc = new RTCPeerConnection(rtcConfiguration);
-      peerConnectionRef.current = pc;
-
-      // Add local video track to WebRTC
-      stream.getTracks().forEach((track) => {
-        pc.addTrack(track, stream);
-      });
-
-      // Handle ICE Candidates from Controller
-      pc.onicecandidate = async (event) => {
-        if (event.candidate && currentRoomCodeRef.current) {
-          try {
-            await signaling.sendCandidate(
-              currentRoomCodeRef.current,
-              'controller',
-              event.candidate.toJSON()
-            );
-          } catch (err) {
-            console.warn('Error saving controller candidate:', err);
-          }
-        }
-      };
-
-      // Track connection state
-      pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'connected') {
-          setIsMonitorConnected(true);
-        } else if (
-          pc.connectionState === 'disconnected' ||
-          pc.connectionState === 'failed' ||
-          pc.connectionState === 'closed'
-        ) {
-          setIsMonitorConnected(false);
-        }
-      };
-
-      pc.oniceconnectionstatechange = () => {
-        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-          setIsMonitorConnected(true);
-        } else if (
-          pc.iceConnectionState === 'disconnected' ||
-          pc.iceConnectionState === 'failed'
-        ) {
-          setIsMonitorConnected(false);
-        }
-      };
-
-      // 4. Create WebRTC Offer
-      const offer = await pc.createOffer({
-        offerToReceiveAudio: false,
-        offerToReceiveVideo: false,
-      });
-      await pc.setLocalDescription(offer);
-
-      const initialFrame = captureFrame();
-
-      // 5. Store room and offer in Backend Server
-      await signaling.createRoom(
-        newRoomCode,
-        user.uid,
-        user.fullName || 'Home Camera',
-        {
-          type: offer.type,
-          sdp: offer.sdp,
-        },
-        initialFrame
-      );
-
-      // 6. Listen for Monitor's WebRTC Answer & Candidates via SSE
-      signaling.subscribeToRoom(newRoomCode, {
-        onAnswer: async (data) => {
-          if (data?.answer && !isRemoteDescriptionSetRef.current && pc.signalingState !== 'stable') {
-            try {
-              const answer = new RTCSessionDescription(data.answer);
-              await pc.setRemoteDescription(answer);
-              isRemoteDescriptionSetRef.current = true;
-              setIsMonitorConnected(true);
-
-              // Flush queued candidates
-              while (candidateQueueRef.current.length > 0) {
-                const cand = candidateQueueRef.current.shift();
-                if (cand) {
-                  try {
-                    await pc.addIceCandidate(new RTCIceCandidate(cand));
-                  } catch (e) {
-                    console.warn('Error adding queued candidate:', e);
-                  }
-                }
-              }
-            } catch (err) {
-              console.error('Error setting remote description from answer:', err);
-            }
-          }
-        },
-        onMonitorCandidate: async (candidateData) => {
-          if (isRemoteDescriptionSetRef.current && pc.remoteDescription) {
-            try {
-              await pc.addIceCandidate(new RTCIceCandidate(candidateData));
-            } catch (err) {
-              console.warn('Error adding monitor candidate:', err);
-            }
-          } else {
-            candidateQueueRef.current.push(candidateData);
-          }
-        },
-      });
-
-      // 7. Frame relay sync (every 600ms updates lightweight frame snapshot to ensure feed never drops)
-      frameIntervalRef.current = setInterval(async () => {
-        if (currentRoomCodeRef.current) {
-          const frame = captureFrame();
-          if (frame) {
-            signaling.sendFrame(currentRoomCodeRef.current, frame);
-          }
-        }
-      }, 600);
-
-      setIsCameraActive(true);
+      await initializeBroadcasting(stream, false);
     } catch (err: any) {
       console.error('Failed to start camera:', err);
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        setErrorMessage('Camera access was denied. Please allow camera permission in your browser to start broadcasting.');
+      const isDenied =
+        err.name === 'NotAllowedError' ||
+        err.name === 'PermissionDeniedError' ||
+        err.message?.toLowerCase().includes('permission denied');
+
+      setIsPermissionDenied(isDenied);
+
+      if (isDenied) {
+        setErrorMessage('Camera access was denied by your browser or iframe permissions.');
       } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-        setErrorMessage('No camera was detected on this device. Please connect a webcam or use a phone.');
+        setErrorMessage('No physical camera was found on this device.');
       } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
-        setErrorMessage('Camera is currently busy in another tab or application. Please close other camera tabs and retry.');
+        setErrorMessage('The camera is in use by another application or tab.');
       } else {
-        setErrorMessage(err.message || 'Could not start camera. Please verify device permissions.');
+        setErrorMessage(err.message || 'Could not access device camera.');
       }
       await stopCamera();
     } finally {
@@ -311,8 +336,28 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
     }
   };
 
+  // 1-Click Simulated CCTV Camera (instant broadcast without hardware camera restrictions)
+  const startVirtualCCTV = async () => {
+    setErrorMessage(null);
+    setIsStarting(true);
+    isRemoteDescriptionSetRef.current = false;
+    candidateQueueRef.current = [];
+
+    try {
+      const { stream, stop } = createVirtualCCTVStream(`${user.fullName?.toUpperCase() || 'HOME'} [CAM-01]`);
+      virtualCleanupRef.current = stop;
+      await initializeBroadcasting(stream, true);
+    } catch (err: any) {
+      console.error('Failed to start virtual stream:', err);
+      setErrorMessage(err.message || 'Failed to initialize virtual CCTV stream.');
+      await stopCamera();
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
   const handleSwitchCamera = async () => {
-    if (!isCameraActive) return;
+    if (!isCameraActive || isVirtualMode) return;
     const newFacingMode = facingMode === 'environment' ? 'user' : 'environment';
     setFacingMode(newFacingMode);
 
@@ -360,6 +405,11 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
     }
   };
 
+  const openInNewWindow = () => {
+    const directUrl = `${window.location.origin}${window.location.pathname}?role=controller`;
+    window.open(directUrl, '_blank', 'noopener,noreferrer');
+  };
+
   return (
     <div id="controller-mode" className="w-full max-w-md mx-auto p-4 sm:p-6">
       {/* Title & Subtitle */}
@@ -373,20 +423,51 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
         </p>
       </div>
 
+      {/* Permission Denied & Troubleshooting Helper */}
       {errorMessage && (
-        <div className="mb-4 p-3.5 rounded-xl bg-red-950/50 border border-red-800/60 text-red-300 text-sm flex items-start gap-2.5">
-          <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
-          <div className="leading-snug">
-            {errorMessage}
-            <div className="mt-2">
-              <button
-                type="button"
-                onClick={startCamera}
-                className="px-3 py-1.5 rounded-lg bg-red-800 hover:bg-red-700 text-white text-xs font-semibold transition"
-              >
-                Retry Camera
-              </button>
+        <div id="camera-error-banner" className="mb-4 p-4 rounded-2xl bg-red-950/40 border border-red-800/60 text-red-200 text-sm shadow-lg space-y-3">
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+            <div>
+              <p className="font-bold text-red-100">{errorMessage}</p>
+              {isPermissionDenied && (
+                <p className="text-xs text-red-300 mt-1 leading-relaxed">
+                  To enable your physical camera: Click the <strong>camera / padlock icon</strong> in your browser's address bar and set Camera to <strong>"Allow"</strong>, or open the app in a new tab.
+                </p>
+              )}
             </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <button
+              id="btn-retry-camera"
+              type="button"
+              onClick={startCamera}
+              className="px-3 py-1.5 rounded-xl bg-red-800 hover:bg-red-700 text-white text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow"
+            >
+              <Camera className="w-3.5 h-3.5" />
+              Retry Permission
+            </button>
+
+            <button
+              id="btn-open-new-tab"
+              type="button"
+              onClick={openInNewWindow}
+              className="px-3 py-1.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-semibold border border-neutral-700 transition flex items-center gap-1.5 cursor-pointer"
+            >
+              <ExternalLink className="w-3.5 h-3.5 text-blue-400" />
+              Open in New Tab
+            </button>
+
+            <button
+              id="btn-start-virtual-cctv"
+              type="button"
+              onClick={startVirtualCCTV}
+              className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow ml-auto"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              Use Virtual CCTV Feed
+            </button>
           </div>
         </div>
       )}
@@ -402,19 +483,19 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
             muted
             className={`w-full h-full object-cover ${
               !isCameraActive ? 'hidden' : ''
-            } ${facingMode === 'user' ? 'scale-x-[-1]' : ''}`}
+            } ${!isVirtualMode && facingMode === 'user' ? 'scale-x-[-1]' : ''}`}
           />
 
           {!isCameraActive && (
             <div className="text-center p-6 flex flex-col items-center">
-              <div className="w-14 h-14 rounded-2xl bg-neutral-900 border border-neutral-800 flex items-center justify-center text-neutral-500 mb-3">
+              <div className="w-14 h-14 rounded-2xl bg-neutral-900 border border-neutral-800 flex items-center justify-center text-neutral-500 mb-3 shadow-inner">
                 <Camera className="w-7 h-7" />
               </div>
               <p className="text-sm font-medium text-neutral-300">
                 Camera is currently inactive
               </p>
-              <p className="text-xs text-neutral-500 mt-1 max-w-xs">
-                Press "Start Camera" below. You will receive a 6-digit code for your Monitor phone.
+              <p className="text-xs text-neutral-500 mt-1 max-w-xs leading-relaxed">
+                Press "Start Camera" to broadcast your physical camera, or "Simulate CCTV Stream" for instant testing.
               </p>
             </div>
           )}
@@ -424,12 +505,12 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
             <div className="absolute top-3 left-3 right-3 flex items-center justify-between pointer-events-none">
               <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/70 backdrop-blur-sm border border-white/10 text-xs font-semibold text-white">
                 <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                LIVE CAMERA
+                {isVirtualMode ? 'VIRTUAL CCTV FEED' : 'LIVE CAMERA'}
               </div>
 
               <div className="px-2.5 py-1 rounded-full bg-black/70 backdrop-blur-sm border border-white/10 text-xs font-mono text-neutral-300 flex items-center gap-1">
                 <Wifi className="w-3 h-3 text-emerald-400" />
-                {facingMode === 'environment' ? 'Rear' : 'Front'}
+                {isVirtualMode ? 'Test HD' : facingMode === 'environment' ? 'Rear' : 'Front'}
               </div>
             </div>
           )}
@@ -506,7 +587,9 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
               {isCameraActive ? (
                 <>
                   <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                  <span className="text-emerald-400">Broadcasting</span>
+                  <span className="text-emerald-400">
+                    {isVirtualMode ? 'Broadcasting (Virtual CCTV)' : 'Broadcasting (Live)'}
+                  </span>
                 </>
               ) : (
                 <>
@@ -546,27 +629,42 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
         {/* Action Controls */}
         <div className="p-4 pt-0 space-y-2.5">
           {!isCameraActive ? (
-            <button
-              id="btn-start-camera"
-              type="button"
-              onClick={startCamera}
-              disabled={isStarting}
-              className="w-full py-3.5 px-4 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-neutral-950 font-bold text-base transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-950/40 disabled:opacity-50 cursor-pointer"
-            >
-              <Video className="w-5 h-5" />
-              {isStarting ? 'Opening Camera...' : 'Start Camera'}
-            </button>
+            <div className="space-y-2">
+              <button
+                id="btn-start-camera"
+                type="button"
+                onClick={startCamera}
+                disabled={isStarting}
+                className="w-full py-3.5 px-4 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-neutral-950 font-bold text-base transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-950/40 disabled:opacity-50 cursor-pointer"
+              >
+                <Video className="w-5 h-5" />
+                {isStarting ? 'Accessing Camera...' : 'Start Physical Camera'}
+              </button>
+
+              <button
+                id="btn-start-virtual"
+                type="button"
+                onClick={startVirtualCCTV}
+                disabled={isStarting}
+                className="w-full py-2.5 px-4 rounded-xl bg-neutral-950 hover:bg-neutral-800 text-neutral-300 font-semibold text-xs sm:text-sm border border-neutral-700 transition flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <Sparkles className="w-4 h-4 text-emerald-400" />
+                <span>Simulate CCTV Stream (No Camera Required)</span>
+              </button>
+            </div>
           ) : (
             <div className="space-y-2.5">
-              <button
-                id="btn-switch-camera"
-                type="button"
-                onClick={handleSwitchCamera}
-                className="w-full py-2.5 px-4 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-neutral-200 font-medium text-sm border border-neutral-700 transition flex items-center justify-center gap-2 cursor-pointer"
-              >
-                <SwitchCamera className="w-4 h-4" />
-                Switch Camera (Front / Rear)
-              </button>
+              {!isVirtualMode && (
+                <button
+                  id="btn-switch-camera"
+                  type="button"
+                  onClick={handleSwitchCamera}
+                  className="w-full py-2.5 px-4 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-neutral-200 font-medium text-sm border border-neutral-700 transition flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <SwitchCamera className="w-4 h-4" />
+                  Switch Camera (Front / Rear)
+                </button>
+              )}
 
               <button
                 id="btn-stop-camera"
@@ -575,7 +673,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
                 className="w-full py-3 px-4 rounded-xl bg-red-600 hover:bg-red-500 text-white font-bold text-base transition flex items-center justify-center gap-2 shadow-lg shadow-red-950/40 cursor-pointer"
               >
                 <VideoOff className="w-5 h-5" />
-                Stop Camera
+                Stop Broadcasting
               </button>
             </div>
           )}
@@ -584,3 +682,4 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
     </div>
   );
 };
+
