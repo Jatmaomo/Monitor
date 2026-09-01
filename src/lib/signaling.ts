@@ -59,7 +59,12 @@ export class SignalingClient {
 
   async getLatestFrame(roomCode: string): Promise<{ frame: string | null; cameraName?: string } | null> {
     try {
-      const response = await fetch(`/api/rooms/${roomCode}/frame`);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2000);
+      const response = await fetch(`/api/rooms/${roomCode}/frame`, {
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
       if (!response.ok) return null;
       return await response.json();
     } catch {
@@ -110,11 +115,15 @@ export class SignalingClient {
 
   async sendFrame(roomCode: string, frame: string): Promise<boolean> {
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2000);
       const response = await fetch(`/api/rooms/${roomCode}/frame`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ frame }),
+        signal: controller.signal,
       });
+      clearTimeout(timeoutId);
       return response.ok;
     } catch {
       return false;

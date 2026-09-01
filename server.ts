@@ -54,6 +54,9 @@ function broadcastToRoom(roomId: string, eventType: string, data: any) {
     const res = clients[i];
     try {
       res.write(payload);
+      if (typeof (res as any).flush === 'function') {
+        (res as any).flush();
+      }
     } catch {
       clients.splice(i, 1);
     }

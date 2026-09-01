@@ -47,6 +47,8 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
   const [cameraLabel, setCameraLabel] = useState<string>('CAM-01 [HOME CAMERA]');
   const [connectionStatus, setConnectionStatus] = useState<ConnectionState>('idle');
   const [isCameraLive, setIsCameraLive] = useState(false);
+  const [hasWebRTCVideo, setHasWebRTCVideo] = useState(false);
+  const [streamType, setStreamType] = useState<'p2p' | 'relay'>('relay');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [activeFrame, setActiveFrame] = useState<string | null>(null);
@@ -67,7 +69,7 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
   const isRemoteDescriptionSetRef = useRef<boolean>(false);
   const framePollerRef = useRef<any>(null);
   const lastFrameTimeRef = useRef<number>(Date.now());
-  const frameCounterRef = useRef<number>(0);
+  const isPollingRef = useRef<boolean>(false);
 
   // Load recent rooms from storage
   useEffect(() => {
@@ -130,6 +132,7 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
     isRemoteDescriptionSetRef.current = false;
     candidateQueueRef.current = [];
     setActiveFrame(null);
+    setHasWebRTCVideo(false);
     setConnectionStatus('idle');
     setIsCameraLive(false);
     setActiveRoomCode(null);
@@ -163,6 +166,8 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
     setErrorMessage(null);
     setConnectionStatus('connecting');
     setIsCameraLive(false);
+    setHasWebRTCVideo(false);
+    setStreamType('relay');
     isRemoteDescriptionSetRef.current = false;
     candidateQueueRef.current = [];
     addLog(`Initiating secure handshake for Room #${raw}...`, 'info');
@@ -186,29 +191,38 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
       if (roomData.lastFrame) {
         setActiveFrame(roomData.lastFrame);
         setIsCameraLive(true);
+        lastFrameTimeRef.current = Date.now();
       }
 
       setActiveRoomCode(raw);
       saveRecentRoom(raw);
       addLog(`Room #${raw} located. Authenticating live video stream...`, 'info');
 
-      // 2. Start fast fallback frame polling (every 200ms) to ensure feed NEVER goes black
+      // 2. Smart fallback frame poller (only polls if SSE was idle for > 1500ms)
       if (framePollerRef.current) {
         clearInterval(framePollerRef.current);
       }
       framePollerRef.current = setInterval(async () => {
-        const frameData = await signaling.getLatestFrame(raw);
-        if (frameData && frameData.frame) {
-          setActiveFrame(frameData.frame);
-          if (frameData.cameraName) {
-            setCameraLabel(frameData.cameraName);
+        if (Date.now() - lastFrameTimeRef.current > 1500 && !isPollingRef.current) {
+          isPollingRef.current = true;
+          try {
+            const frameData = await signaling.getLatestFrame(raw);
+            if (frameData?.frame) {
+              setActiveFrame(frameData.frame);
+              if (frameData.cameraName) {
+                setCameraLabel(frameData.cameraName);
+              }
+              setIsCameraLive(true);
+              setConnectionStatus('connected');
+              lastFrameTimeRef.current = Date.now();
+            }
+          } finally {
+            isPollingRef.current = false;
           }
-          setIsCameraLive(true);
-          setConnectionStatus('connected');
         }
-      }, 200);
+      }, 800);
 
-      // 3. Create RTCPeerConnection for high-definition streaming
+      // 3. Create RTCPeerConnection for high-definition direct P2P streaming
       if (roomData.offer) {
         const pc = new RTCPeerConnection(rtcConfiguration);
         peerConnectionRef.current = pc;
@@ -218,15 +232,20 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
           if (event.streams && event.streams[0]) {
             if (videoRef.current) {
               videoRef.current.srcObject = event.streams[0];
+              videoRef.current.onloadeddata = () => {
+                setHasWebRTCVideo(true);
+                setStreamType('p2p');
+                setIsCameraLive(true);
+              };
               try {
                 await videoRef.current.play();
               } catch (playErr) {
-                console.warn('Video auto-play handled:', playErr);
+                console.warn('Video auto-play note:', playErr);
               }
             }
             setIsCameraLive(true);
             setConnectionStatus('connected');
-            addLog('WebRTC Direct HD Video Channel Locked', 'success');
+            addLog('WebRTC Direct HD Video Channel Connected', 'success');
           }
         };
 
@@ -246,14 +265,15 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
           if (pc.connectionState === 'connected') {
             setConnectionStatus('connected');
             setIsCameraLive(true);
+            setStreamType('p2p');
             addLog('Hardware P2P Encryption Active', 'success');
           } else if (
             pc.connectionState === 'disconnected' ||
             pc.connectionState === 'failed' ||
             pc.connectionState === 'closed'
           ) {
-            // Keep active frame relay intact
-            console.warn('WebRTC state:', pc.connectionState, '- frame relay active');
+            setHasWebRTCVideo(false);
+            setStreamType('relay');
           }
         };
 
@@ -316,16 +336,18 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
           }
         },
         onFrame: (data) => {
-          if (data.frame) {
+          if (data?.frame) {
             setActiveFrame(data.frame);
             setIsCameraLive(true);
             setConnectionStatus('connected');
+            lastFrameTimeRef.current = Date.now();
           }
         },
         onDisconnected: () => {
           addLog('Controller broadcast disconnected', 'warning');
           setConnectionStatus('lost');
           setIsCameraLive(false);
+          setHasWebRTCVideo(false);
         },
       });
 
@@ -510,26 +532,24 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
             <div className="absolute inset-0 bg-white z-40 transition-opacity duration-150 animate-pulse pointer-events-none" />
           )}
 
-          {/* WebRTC Video Element */}
+          {/* WebRTC Video Element (High-Definition direct stream) */}
           <video
             ref={videoRef}
             autoPlay
             playsInline
             muted
             className={`w-full h-full object-contain bg-black transition-transform duration-200 ${getFilterStyle()} ${
-              connectionStatus !== 'connected' || !isCameraLive ? 'hidden' : ''
+              connectionStatus === 'connected' && isCameraLive && hasWebRTCVideo ? 'block' : 'hidden'
             }`}
             style={{ transform: `scale(${zoomLevel})` }}
           />
 
-          {/* Real-time Fast JPEG Frame Relay (Instant Backup Stream) */}
-          {connectionStatus === 'connected' && isCameraLive && activeFrame && (
+          {/* Real-time Fast JPEG Frame Relay (Instant Backup & Primary Stream) */}
+          {connectionStatus === 'connected' && isCameraLive && activeFrame && !hasWebRTCVideo && (
             <img
               src={activeFrame}
               alt="Live Camera Stream"
-              className={`w-full h-full object-contain bg-black absolute inset-0 transition-transform duration-200 ${getFilterStyle()} ${
-                videoRef.current?.srcObject && !videoRef.current?.paused ? 'opacity-0' : 'opacity-100'
-              }`}
+              className={`w-full h-full object-contain bg-black transition-transform duration-200 ${getFilterStyle()}`}
               style={{ transform: `scale(${zoomLevel})` }}
             />
           )}
@@ -848,7 +868,9 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
               {connectionStatus === 'connected' ? (
                 <>
                   <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                  <span className="text-emerald-400">Encrypted P2P Link</span>
+                  <span className="text-emerald-400">
+                    {hasWebRTCVideo ? 'Hardware P2P Direct' : 'Encrypted Cloud Relay'}
+                  </span>
                 </>
               ) : connectionStatus === 'lost' ? (
                 <>

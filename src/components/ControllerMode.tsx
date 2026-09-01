@@ -48,15 +48,21 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
   const virtualGetFrameRef = useRef<(() => string | null) | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const currentRoomCodeRef = useRef<string | null>(null);
-  const frameIntervalRef = useRef<any>(null);
+  const isBroadcastingRef = useRef<boolean>(false);
+  const frameTimeoutRef = useRef<any>(null);
+  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const candidateQueueRef = useRef<RTCIceCandidateInit[]>([]);
   const isRemoteDescriptionSetRef = useRef<boolean>(false);
+  const isRoomCreatedRef = useRef<boolean>(false);
 
   // Helper to stop camera and cleanup WebRTC
   const stopCamera = useCallback(async () => {
-    if (frameIntervalRef.current) {
-      clearInterval(frameIntervalRef.current);
-      frameIntervalRef.current = null;
+    isBroadcastingRef.current = false;
+    isRoomCreatedRef.current = false;
+
+    if (frameTimeoutRef.current) {
+      clearTimeout(frameTimeoutRef.current);
+      frameTimeoutRef.current = null;
     }
 
     if (virtualCleanupRef.current) {
@@ -167,17 +173,38 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
       const video = videoRef.current;
       const w = video.videoWidth || 640;
       const h = video.videoHeight || 480;
-      const canvas = document.createElement('canvas');
-      canvas.width = 480;
-      canvas.height = Math.round((h / w) * 480) || 360;
+      if (w === 0 || h === 0) return null;
+
+      if (!offscreenCanvasRef.current) {
+        offscreenCanvasRef.current = document.createElement('canvas');
+      }
+      const canvas = offscreenCanvasRef.current;
+      canvas.width = 440;
+      canvas.height = Math.round((h / w) * 440) || 330;
       const ctx = canvas.getContext('2d');
       if (!ctx) return null;
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      return canvas.toDataURL('image/jpeg', 0.55);
+      return canvas.toDataURL('image/jpeg', 0.50);
     } catch {
       return null;
     }
   }, []);
+
+  // Frame streaming loop: single in-flight request at all times
+  const startFrameStreamingLoop = useCallback(() => {
+    isBroadcastingRef.current = true;
+    const run = async () => {
+      if (!isBroadcastingRef.current || !currentRoomCodeRef.current) return;
+      const frame = captureFrame();
+      if (frame && currentRoomCodeRef.current) {
+        await signaling.sendFrame(currentRoomCodeRef.current, frame);
+      }
+      if (isBroadcastingRef.current) {
+        frameTimeoutRef.current = setTimeout(run, 130);
+      }
+    };
+    run();
+  }, [captureFrame]);
 
   // Core stream initialization shared between real camera and virtual CCTV stream
   const initializeBroadcasting = async (stream: MediaStream, isVirtual: boolean, locationLabel: string) => {
@@ -197,6 +224,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
     const newRoomCode = generateRoomCode();
     setRoomCode(newRoomCode);
     currentRoomCodeRef.current = newRoomCode;
+    isRoomCreatedRef.current = false;
 
     // Create WebRTC Peer Connection
     const pc = new RTCPeerConnection(rtcConfiguration);
@@ -207,17 +235,20 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
       pc.addTrack(track, stream);
     });
 
+    const pendingControllerCandidates: RTCIceCandidateInit[] = [];
+
     // Handle ICE Candidates from Controller
     pc.onicecandidate = async (event) => {
       if (event.candidate && currentRoomCodeRef.current) {
-        try {
-          await signaling.sendCandidate(
-            currentRoomCodeRef.current,
-            'controller',
-            event.candidate.toJSON()
-          );
-        } catch (err) {
-          console.warn('Error saving controller candidate:', err);
+        const candidateJson = event.candidate.toJSON();
+        if (isRoomCreatedRef.current) {
+          try {
+            await signaling.sendCandidate(currentRoomCodeRef.current, 'controller', candidateJson);
+          } catch (err) {
+            console.warn('Error sending controller candidate:', err);
+          }
+        } else {
+          pendingControllerCandidates.push(candidateJson);
         }
       }
     };
@@ -256,6 +287,17 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
       initialFrame,
       locationLabel
     );
+
+    isRoomCreatedRef.current = true;
+
+    // Flush any candidates gathered during offer creation
+    for (const cand of pendingControllerCandidates) {
+      try {
+        await signaling.sendCandidate(newRoomCode, 'controller', cand);
+      } catch (err) {
+        console.warn('Error flushing candidate:', err);
+      }
+    }
 
     // Listen for Monitor's WebRTC Answer & Candidates via SSE
     signaling.subscribeToRoom(newRoomCode, {
@@ -296,15 +338,8 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
       },
     });
 
-    // High-frequency Frame relay sync (every 180ms streams frames so Monitor is always live)
-    frameIntervalRef.current = setInterval(async () => {
-      if (currentRoomCodeRef.current) {
-        const frame = captureFrame();
-        if (frame) {
-          signaling.sendFrame(currentRoomCodeRef.current, frame);
-        }
-      }
-    }, 180);
+    // Start lightweight continuous frame sync
+    startFrameStreamingLoop();
 
     setIsVirtualMode(isVirtual);
     setIsCameraActive(true);
