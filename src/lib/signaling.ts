@@ -5,6 +5,7 @@ export interface RoomSignalData {
   id: string;
   controllerId: string;
   controllerName: string;
+  cameraName?: string;
   offer: RTCSessionDescriptionInit;
   answer?: RTCSessionDescriptionInit;
   controllerCandidates?: RTCIceCandidateInit[];
@@ -22,7 +23,8 @@ export class SignalingClient {
     controllerId: string,
     controllerName: string,
     offer: RTCSessionDescriptionInit,
-    frame?: string | null
+    frame?: string | null,
+    cameraName?: string
   ): Promise<boolean> {
     try {
       const response = await fetch('/api/rooms/create', {
@@ -34,6 +36,7 @@ export class SignalingClient {
           controllerName,
           offer,
           frame,
+          cameraName,
         }),
       });
       return response.ok;
@@ -50,6 +53,16 @@ export class SignalingClient {
       return await response.json();
     } catch (err) {
       console.warn('Signaling getRoom error:', err);
+      return null;
+    }
+  }
+
+  async getLatestFrame(roomCode: string): Promise<{ frame: string | null; cameraName?: string } | null> {
+    try {
+      const response = await fetch(`/api/rooms/${roomCode}/frame`);
+      if (!response.ok) return null;
+      return await response.json();
+    } catch {
       return null;
     }
   }

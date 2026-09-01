@@ -23,6 +23,7 @@ interface Room {
   status: 'waiting' | 'connected' | 'disconnected';
   lastHeartbeat: number;
   lastFrame?: string;
+  cameraName?: string;
   updatedAt: number;
 }
 
@@ -35,11 +36,11 @@ function hashPassword(password: string): string {
   return crypto.createHash('sha256').update(password + '_jat_maomo_salt').digest('hex');
 }
 
-// Cleanup stale rooms (older than 30 minutes)
+// Cleanup stale rooms (older than 60 minutes)
 setInterval(() => {
   const now = Date.now();
   for (const [id, room] of rooms.entries()) {
-    if (now - room.updatedAt > 30 * 60 * 1000) {
+    if (now - room.updatedAt > 60 * 60 * 1000) {
       rooms.delete(id);
       sseClients.delete(id);
     }
@@ -49,11 +50,12 @@ setInterval(() => {
 function broadcastToRoom(roomId: string, eventType: string, data: any) {
   const clients = sseClients.get(roomId) || [];
   const payload = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const res of clients) {
+  for (let i = clients.length - 1; i >= 0; i--) {
+    const res = clients[i];
     try {
       res.write(payload);
     } catch {
-      // ignore client error
+      clients.splice(i, 1);
     }
   }
 }
@@ -182,7 +184,7 @@ async function startServer() {
 
   // Create Room (Controller Mode)
   app.post('/api/rooms/create', (req, res) => {
-    const { id, controllerId, controllerName, offer, frame } = req.body;
+    const { id, controllerId, controllerName, offer, frame, cameraName } = req.body;
     if (!id || !offer) {
       return res.status(400).json({ error: 'Missing room id or offer' });
     }
@@ -191,6 +193,7 @@ async function startServer() {
       id,
       controllerId: controllerId || 'anonymous',
       controllerName: controllerName || 'Controller Phone',
+      cameraName: cameraName || 'CAM-01 [MAIN ENTRANCE]',
       offer,
       controllerCandidates: [],
       monitorCandidates: [],
@@ -211,6 +214,20 @@ async function startServer() {
       return res.status(404).json({ error: 'Room not found. Please verify the 6-digit code.' });
     }
     res.json(room);
+  });
+
+  // Fast frame poll endpoint (fallback for SSE)
+  app.get('/api/rooms/:id/frame', (req, res) => {
+    const room = rooms.get(req.params.id);
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+    res.json({
+      frame: room.lastFrame || null,
+      updatedAt: room.updatedAt,
+      status: room.status,
+      cameraName: room.cameraName,
+    });
   });
 
   // Submit WebRTC Answer (Monitor Mode)

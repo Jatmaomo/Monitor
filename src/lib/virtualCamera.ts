@@ -1,9 +1,14 @@
 /**
- * Creates a synthetic CCTV canvas stream for testing and fallback when hardware camera
- * permission is blocked or unavailable in iframe sandbox environments.
+ * Creates a synthetic high-resolution CCTV surveillance canvas stream
+ * with realistic camera HUD, motion tracker, timestamp, and instant frame snapshotting.
  */
-export function createVirtualCCTVStream(label = 'LIVING ROOM [CAM-01]'): {
+
+export type CameraPreset = 'LIVING ROOM [CAM-01]' | 'FRONT DOOR [CAM-02]' | 'GARAGE & DRIVEWAY [CAM-03]' | 'NURSERY [CAM-04]';
+
+export function createVirtualCCTVStream(label: string = 'LIVING ROOM [CAM-01]'): {
   stream: MediaStream;
+  getFrame: () => string | null;
+  canvas: HTMLCanvasElement;
   stop: () => void;
 } {
   const canvas = document.createElement('canvas');
@@ -18,112 +23,195 @@ export function createVirtualCCTVStream(label = 'LIVING ROOM [CAM-01]'): {
     if (!ctx) return;
     frameCount++;
 
-    // 1. Dark ambient room background
+    // 1. Tactical Surveillance Dark Background
     const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
-    gradient.addColorStop(0, '#0f172a');
-    gradient.addColorStop(0.5, '#1e293b');
-    gradient.addColorStop(1, '#0f172a');
+    if (label.includes('FRONT DOOR')) {
+      gradient.addColorStop(0, '#020617');
+      gradient.addColorStop(0.6, '#0f172a');
+      gradient.addColorStop(1, '#020617');
+    } else if (label.includes('GARAGE')) {
+      gradient.addColorStop(0, '#090d16');
+      gradient.addColorStop(0.5, '#1e293b');
+      gradient.addColorStop(1, '#090d16');
+    } else {
+      gradient.addColorStop(0, '#0b1329');
+      gradient.addColorStop(0.5, '#111e38');
+      gradient.addColorStop(1, '#080e1e');
+    }
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // 2. Room furniture outlines (Living room security view)
-    ctx.strokeStyle = 'rgba(74, 222, 128, 0.25)';
-    ctx.lineWidth = 2;
+    // 2. Perspective & Room Elements
+    ctx.strokeStyle = 'rgba(56, 189, 248, 0.2)';
+    ctx.lineWidth = 1.5;
 
-    // Floor perspective grid lines
+    // Floor lines
     ctx.beginPath();
-    ctx.moveTo(0, canvas.height * 0.7);
-    ctx.lineTo(canvas.width, canvas.height * 0.7);
-    ctx.moveTo(canvas.width * 0.2, canvas.height * 0.7);
+    ctx.moveTo(0, canvas.height * 0.72);
+    ctx.lineTo(canvas.width, canvas.height * 0.72);
+    ctx.moveTo(canvas.width * 0.15, canvas.height * 0.72);
     ctx.lineTo(0, canvas.height);
-    ctx.moveTo(canvas.width * 0.8, canvas.height * 0.7);
+    ctx.moveTo(canvas.width * 0.85, canvas.height * 0.72);
     ctx.lineTo(canvas.width, canvas.height);
     ctx.stroke();
 
-    // Window frame with outdoor night glow
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.8)';
-    ctx.fillRect(canvas.width * 0.65, canvas.height * 0.15, 160, 180);
-    ctx.strokeStyle = 'rgba(56, 189, 248, 0.4)';
-    ctx.strokeRect(canvas.width * 0.65, canvas.height * 0.15, 160, 180);
+    if (label.includes('FRONT DOOR')) {
+      // Porch Doorway
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.4)';
+      ctx.strokeRect(canvas.width * 0.35, canvas.height * 0.2, 190, 250);
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(canvas.width * 0.35, canvas.height * 0.2, 190, 250);
 
-    // Living room sofa
-    ctx.fillStyle = '#334155';
+      // Outdoor garden light
+      ctx.fillStyle = 'rgba(234, 179, 8, 0.2)';
+      ctx.beginPath();
+      ctx.arc(canvas.width * 0.3, canvas.height * 0.3, 30, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (label.includes('GARAGE')) {
+      // Garage shutter lines
+      ctx.strokeStyle = 'rgba(100, 116, 139, 0.3)';
+      for (let y = canvas.height * 0.2; y < canvas.height * 0.7; y += 20) {
+        ctx.beginPath();
+        ctx.moveTo(canvas.width * 0.1, y);
+        ctx.lineTo(canvas.width * 0.9, y);
+        ctx.stroke();
+      }
+    } else {
+      // Living Room Sofa & Window
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+      ctx.fillRect(canvas.width * 0.65, canvas.height * 0.15, 160, 180);
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.35)';
+      ctx.strokeRect(canvas.width * 0.65, canvas.height * 0.15, 160, 180);
+
+      ctx.fillStyle = '#1e293b';
+      ctx.beginPath();
+      ctx.roundRect(canvas.width * 0.12, canvas.height * 0.54, 230, 95, [8, 8, 0, 0]);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.3)';
+      ctx.stroke();
+    }
+
+    // 3. Motion Target Simulation (Tracking bounding box)
+    const targetX = canvas.width * 0.5 + Math.sin(frameCount * 0.025) * 140;
+    const targetY = canvas.height * 0.68 + Math.cos(frameCount * 0.015) * 12;
+    const boxW = 40;
+    const boxH = 40;
+
+    // Tactical Target Reticle
+    ctx.strokeStyle = '#10b981';
+    ctx.lineWidth = 1.5;
+    // Corner brackets
+    const cSize = 8;
+    // Top Left
     ctx.beginPath();
-    ctx.roundRect(canvas.width * 0.15, canvas.height * 0.55, 240, 90, [10, 10, 0, 0]);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.4)';
+    ctx.moveTo(targetX - boxW / 2, targetY - boxH / 2 + cSize);
+    ctx.lineTo(targetX - boxW / 2, targetY - boxH / 2);
+    ctx.lineTo(targetX - boxW / 2 + cSize, targetY - boxH / 2);
+    // Top Right
+    ctx.moveTo(targetX + boxW / 2 - cSize, targetY - boxH / 2);
+    ctx.lineTo(targetX + boxW / 2, targetY - boxH / 2);
+    ctx.lineTo(targetX + boxW / 2, targetY - boxH / 2 + cSize);
+    // Bottom Left
+    ctx.moveTo(targetX - boxW / 2, targetY + boxH / 2 - cSize);
+    ctx.lineTo(targetX - boxW / 2, targetY + boxH / 2);
+    ctx.lineTo(targetX - boxW / 2 + cSize, targetY + boxH / 2);
+    // Bottom Right
+    ctx.moveTo(targetX + boxW / 2 - cSize, targetY + boxH / 2);
+    ctx.lineTo(targetX + boxW / 2, targetY + boxH / 2);
+    ctx.lineTo(targetX + boxW / 2, targetY + boxH / 2 - cSize);
     ctx.stroke();
 
-    // Subtle moving indicator (e.g. simulated pet or motion pulse)
-    const motionX = canvas.width * 0.5 + Math.sin(frameCount * 0.03) * 120;
-    const motionY = canvas.height * 0.72 + Math.cos(frameCount * 0.02) * 15;
-    ctx.fillStyle = 'rgba(16, 185, 129, 0.7)';
+    // Target label
+    ctx.fillStyle = '#10b981';
+    ctx.font = '10px monospace';
+    ctx.fillText('TARGET_01', targetX - boxW / 2, targetY - boxH / 2 - 4);
+
+    // Subtle motion dot
+    ctx.fillStyle = 'rgba(16, 185, 129, 0.8)';
     ctx.beginPath();
-    ctx.arc(motionX, motionY, 6, 0, Math.PI * 2);
+    ctx.arc(targetX, targetY, 4, 0, Math.PI * 2);
     ctx.fill();
 
-    // Motion pulse ring
-    const pulseRadius = 12 + (frameCount % 30);
-    ctx.strokeStyle = `rgba(16, 185, 129, ${Math.max(0, 1 - pulseRadius / 42)})`;
-    ctx.beginPath();
-    ctx.arc(motionX, motionY, pulseRadius, 0, Math.PI * 2);
-    ctx.stroke();
-
-    // 3. CCTV Scanlines effect
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.15)';
+    // 4. CCTV Scanlines
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.12)';
     for (let y = 0; y < canvas.height; y += 4) {
       ctx.fillRect(0, y, canvas.width, 1.5);
     }
 
-    // 4. CCTV HUD Overlays (REC indicator, timestamp, camera title)
-    // Red REC circle (flashing)
-    if (Math.floor(frameCount / 20) % 2 === 0) {
+    // 5. Tactical Center Crosshair
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(canvas.width / 2 - 15, canvas.height / 2);
+    ctx.lineTo(canvas.width / 2 + 15, canvas.height / 2);
+    ctx.moveTo(canvas.width / 2, canvas.height / 2 - 15);
+    ctx.lineTo(canvas.width / 2, canvas.height / 2 + 15);
+    ctx.stroke();
+
+    // 6. Security HUD Header
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(0, 0, canvas.width, 42);
+
+    // Red Flashing REC
+    if (Math.floor(frameCount / 25) % 2 === 0) {
       ctx.fillStyle = '#ef4444';
       ctx.beginPath();
-      ctx.arc(35, 30, 7, 0, Math.PI * 2);
+      ctx.arc(22, 21, 6, 0, Math.PI * 2);
       ctx.fill();
       ctx.fillStyle = '#ffffff';
-      ctx.font = 'bold 13px monospace';
-      ctx.fillText('REC', 48, 35);
+      ctx.font = 'bold 12px monospace';
+      ctx.fillText('REC', 34, 25);
     } else {
-      ctx.fillStyle = '#94a3b8';
-      ctx.font = 'bold 13px monospace';
-      ctx.fillText('REC', 48, 35);
+      ctx.fillStyle = '#64748b';
+      ctx.font = 'bold 12px monospace';
+      ctx.fillText('REC', 34, 25);
     }
 
-    // Camera Label
-    ctx.fillStyle = '#4ade80';
-    ctx.font = 'bold 14px monospace';
-    ctx.fillText(label, 110, 35);
+    // Camera Name
+    ctx.fillStyle = '#10b981';
+    ctx.font = 'bold 13px monospace';
+    ctx.fillText(label, 80, 25);
 
-    // Live Timestamp
+    // Live Timestamp with milliseconds
     const now = new Date();
     const timeStr = now.toTimeString().split(' ')[0] + '.' + String(Math.floor(now.getMilliseconds() / 100));
     const dateStr = now.toISOString().split('T')[0];
-    ctx.fillStyle = '#ffffff';
-    ctx.font = '13px monospace';
-    ctx.fillText(`${dateStr} ${timeStr}`, canvas.width - 210, 35);
-
-    // Bottom status bar
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-    ctx.fillRect(0, canvas.height - 35, canvas.width, 35);
-    ctx.fillStyle = '#38bdf8';
+    ctx.fillStyle = '#e2e8f0';
     ctx.font = '12px monospace';
-    ctx.fillText('SIGNAL: 1080P/30FPS • MODE: TEST/SIMULATION • JAT MAOMO TECH', 20, canvas.height - 14);
+    ctx.fillText(`${dateStr} ${timeStr}`, canvas.width - 190, 25);
+
+    // 7. Security HUD Footer Bar
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+    ctx.fillRect(0, canvas.height - 30, canvas.width, 30);
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = '11px monospace';
+    ctx.fillText('FPS: 30 • 1080P HD • AUDIO: SYNC • SYSTEM: JAT MAOMO TECH', 15, canvas.height - 10);
+
+    // Signal strength meter dots
+    ctx.fillStyle = '#10b981';
+    for (let i = 0; i < 4; i++) {
+      ctx.fillRect(canvas.width - 55 + i * 8, canvas.height - 18, 5, 8 + i * 2);
+    }
 
     animationFrameId = requestAnimationFrame(draw);
   };
 
   draw();
 
-  // Capture canvas stream at 25 fps
-  // Support both standard captureStream and webkit
-  const stream: MediaStream = (canvas as any).captureStream ? (canvas as any).captureStream(25) : new MediaStream();
+  const stream: MediaStream = (canvas as any).captureStream ? (canvas as any).captureStream(30) : new MediaStream();
+
+  const getFrame = (): string | null => {
+    try {
+      return canvas.toDataURL('image/jpeg', 0.55);
+    } catch {
+      return null;
+    }
+  };
 
   const stop = () => {
     cancelAnimationFrame(animationFrameId);
     stream.getTracks().forEach((t) => t.stop());
   };
 
-  return { stream, stop };
+  return { stream, getFrame, canvas, stop };
 }

@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { UserProfile } from '../types';
 import { rtcConfiguration, generateRoomCode } from '../lib/webrtc';
 import { signaling } from '../lib/signaling';
-import { createVirtualCCTVStream } from '../lib/virtualCamera';
+import { createVirtualCCTVStream, CameraPreset } from '../lib/virtualCamera';
 import {
   Camera,
   Video,
@@ -17,7 +17,10 @@ import {
   Eye,
   ExternalLink,
   Sparkles,
-  HelpCircle,
+  Layers,
+  Flashlight,
+  Activity,
+  CheckCircle2,
 } from 'lucide-react';
 
 interface ControllerModeProps {
@@ -27,6 +30,7 @@ interface ControllerModeProps {
 export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [isVirtualMode, setIsVirtualMode] = useState(false);
+  const [cameraPreset, setCameraPreset] = useState<CameraPreset>('LIVING ROOM [CAM-01]');
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
   const [roomCode, setRoomCode] = useState<string | null>(null);
   const [isMonitorConnected, setIsMonitorConnected] = useState(false);
@@ -35,10 +39,13 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isPermissionDenied, setIsPermissionDenied] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
+  const [torchOn, setTorchOn] = useState(false);
+  const [fpsCount, setFpsCount] = useState(30);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const virtualCleanupRef = useRef<(() => void) | null>(null);
+  const virtualGetFrameRef = useRef<(() => string | null) | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const currentRoomCodeRef = useRef<string | null>(null);
   const frameIntervalRef = useRef<any>(null);
@@ -55,6 +62,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
     if (virtualCleanupRef.current) {
       virtualCleanupRef.current();
       virtualCleanupRef.current = null;
+      virtualGetFrameRef.current = null;
     }
 
     if (currentRoomCodeRef.current) {
@@ -97,6 +105,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
     setIsCameraActive(false);
     setIsVirtualMode(false);
     setIsMonitorConnected(false);
+    setTorchOn(false);
     setRoomCode(null);
   }, []);
 
@@ -144,25 +153,34 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
     });
   };
 
-  // Helper to capture a compressed frame for real-time backup relay
-  const captureFrame = () => {
-    if (!videoRef.current || videoRef.current.readyState < 2) return null;
+  // Helper to capture a compressed frame for continuous fast streaming
+  const captureFrame = useCallback(() => {
+    // 1. If virtual camera is running, get frame directly from its canvas
+    if (virtualGetFrameRef.current) {
+      const vFrame = virtualGetFrameRef.current();
+      if (vFrame) return vFrame;
+    }
+
+    // 2. Otherwise capture from video element
+    if (!videoRef.current) return null;
     try {
       const video = videoRef.current;
+      const w = video.videoWidth || 640;
+      const h = video.videoHeight || 480;
       const canvas = document.createElement('canvas');
-      canvas.width = 360;
-      canvas.height = 270;
+      canvas.width = 480;
+      canvas.height = Math.round((h / w) * 480) || 360;
       const ctx = canvas.getContext('2d');
       if (!ctx) return null;
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      return canvas.toDataURL('image/jpeg', 0.5);
+      return canvas.toDataURL('image/jpeg', 0.55);
     } catch {
       return null;
     }
-  };
+  }, []);
 
   // Core stream initialization shared between real camera and virtual CCTV stream
-  const initializeBroadcasting = async (stream: MediaStream, isVirtual: boolean) => {
+  const initializeBroadcasting = async (stream: MediaStream, isVirtual: boolean, locationLabel: string) => {
     streamRef.current = stream;
 
     // Attach stream to local preview video element
@@ -217,17 +235,6 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
       }
     };
 
-    pc.oniceconnectionstatechange = () => {
-      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-        setIsMonitorConnected(true);
-      } else if (
-        pc.iceConnectionState === 'disconnected' ||
-        pc.iceConnectionState === 'failed'
-      ) {
-        setIsMonitorConnected(false);
-      }
-    };
-
     // Create WebRTC Offer
     const offer = await pc.createOffer({
       offerToReceiveAudio: false,
@@ -246,7 +253,8 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
         type: offer.type,
         sdp: offer.sdp,
       },
-      initialFrame
+      initialFrame,
+      locationLabel
     );
 
     // Listen for Monitor's WebRTC Answer & Candidates via SSE
@@ -288,7 +296,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
       },
     });
 
-    // Frame relay sync (every 600ms updates lightweight frame snapshot to ensure feed never drops)
+    // High-frequency Frame relay sync (every 180ms streams frames so Monitor is always live)
     frameIntervalRef.current = setInterval(async () => {
       if (currentRoomCodeRef.current) {
         const frame = captureFrame();
@@ -296,7 +304,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
           signaling.sendFrame(currentRoomCodeRef.current, frame);
         }
       }
-    }, 600);
+    }, 180);
 
     setIsVirtualMode(isVirtual);
     setIsCameraActive(true);
@@ -311,7 +319,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
 
     try {
       const stream = await getCameraMediaStream(facingMode);
-      await initializeBroadcasting(stream, false);
+      await initializeBroadcasting(stream, false, cameraPreset);
     } catch (err: any) {
       console.error('Failed to start camera:', err);
       const isDenied =
@@ -337,16 +345,17 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
   };
 
   // 1-Click Simulated CCTV Camera (instant broadcast without hardware camera restrictions)
-  const startVirtualCCTV = async () => {
+  const startVirtualCCTV = async (preset: CameraPreset = cameraPreset) => {
     setErrorMessage(null);
     setIsStarting(true);
     isRemoteDescriptionSetRef.current = false;
     candidateQueueRef.current = [];
 
     try {
-      const { stream, stop } = createVirtualCCTVStream(`${user.fullName?.toUpperCase() || 'HOME'} [CAM-01]`);
+      const { stream, getFrame, stop } = createVirtualCCTVStream(preset);
       virtualCleanupRef.current = stop;
-      await initializeBroadcasting(stream, true);
+      virtualGetFrameRef.current = getFrame;
+      await initializeBroadcasting(stream, true, preset);
     } catch (err: any) {
       console.error('Failed to start virtual stream:', err);
       setErrorMessage(err.message || 'Failed to initialize virtual CCTV stream.');
@@ -405,34 +414,60 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
     }
   };
 
-  const openInNewWindow = () => {
+  const openMonitorInNewTab = () => {
+    if (roomCode) {
+      const directUrl = `${window.location.origin}${window.location.pathname}?room=${roomCode}&role=monitor`;
+      window.open(directUrl, '_blank', 'noopener,noreferrer');
+    }
+  };
+
+  const openControllerInNewTab = () => {
     const directUrl = `${window.location.origin}${window.location.pathname}?role=controller`;
     window.open(directUrl, '_blank', 'noopener,noreferrer');
   };
 
   return (
-    <div id="controller-mode" className="w-full max-w-md mx-auto p-4 sm:p-6">
-      {/* Title & Subtitle */}
-      <div className="mb-4 text-center">
-        <h2 className="text-xl font-bold text-neutral-100 tracking-tight flex items-center justify-center gap-2">
-          <Camera className="w-5 h-5 text-emerald-400" />
-          Controller Mode
-        </h2>
-        <p className="text-sm text-neutral-400 mt-1">
-          "Use this phone as your home camera."
-        </p>
+    <div id="controller-mode" className="w-full max-w-2xl mx-auto p-3 sm:p-5">
+      {/* Tactical Header */}
+      <div className="mb-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-b border-neutral-800 pb-3">
+        <div className="flex items-center gap-2.5">
+          <div className="w-9 h-9 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shadow-inner">
+            <Camera className="w-5 h-5" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <h2 className="text-base sm:text-lg font-bold text-neutral-100 tracking-tight">
+                Surveillance Camera Station
+              </h2>
+              <span className="px-2 py-0.5 rounded-full bg-emerald-950/80 border border-emerald-800/60 text-[10px] font-mono font-bold text-emerald-300">
+                TRANSMITTER
+              </span>
+            </div>
+            <p className="text-xs text-neutral-400">
+              "Use this phone as your home security camera."
+            </p>
+          </div>
+        </div>
+
+        {/* Status Pill */}
+        {isCameraActive && (
+          <div className="flex items-center gap-2 text-xs font-mono bg-neutral-900 border border-neutral-800 px-3 py-1.5 rounded-xl self-start sm:self-auto">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            <span className="text-emerald-300 font-bold">BROADCASTING</span>
+          </div>
+        )}
       </div>
 
-      {/* Permission Denied & Troubleshooting Helper */}
+      {/* Permission Denied / Error Banner */}
       {errorMessage && (
-        <div id="camera-error-banner" className="mb-4 p-4 rounded-2xl bg-red-950/40 border border-red-800/60 text-red-200 text-sm shadow-lg space-y-3">
+        <div id="camera-error-banner" className="mb-4 p-4 rounded-2xl bg-red-950/50 border border-red-800/70 text-red-200 text-sm shadow-xl space-y-3">
           <div className="flex items-start gap-2.5">
             <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
             <div>
               <p className="font-bold text-red-100">{errorMessage}</p>
               {isPermissionDenied && (
                 <p className="text-xs text-red-300 mt-1 leading-relaxed">
-                  To enable your physical camera: Click the <strong>camera / padlock icon</strong> in your browser's address bar and set Camera to <strong>"Allow"</strong>, or open the app in a new tab.
+                  To enable your physical camera: Click the <strong>camera / padlock icon</strong> in your browser's address bar and set Camera to <strong>"Allow"</strong>, or open in a new tab.
                 </p>
               )}
             </div>
@@ -452,7 +487,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
             <button
               id="btn-open-new-tab"
               type="button"
-              onClick={openInNewWindow}
+              onClick={openControllerInNewTab}
               className="px-3 py-1.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-semibold border border-neutral-700 transition flex items-center gap-1.5 cursor-pointer"
             >
               <ExternalLink className="w-3.5 h-3.5 text-blue-400" />
@@ -462,8 +497,8 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
             <button
               id="btn-start-virtual-cctv"
               type="button"
-              onClick={startVirtualCCTV}
-              className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow ml-auto"
+              onClick={() => startVirtualCCTV()}
+              className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-neutral-950 text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow ml-auto"
             >
               <Sparkles className="w-3.5 h-3.5" />
               Use Virtual CCTV Feed
@@ -472,10 +507,10 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
         </div>
       )}
 
-      {/* Main Camera Card */}
-      <div className="bg-neutral-900 border border-neutral-800 rounded-2xl overflow-hidden shadow-xl">
+      {/* Main Tactical Camera Card */}
+      <div className="bg-neutral-900 border border-neutral-800 rounded-2xl overflow-hidden shadow-2xl">
         {/* Camera Preview Area */}
-        <div className="relative aspect-video sm:aspect-4/3 bg-neutral-950 flex items-center justify-center overflow-hidden">
+        <div className="relative aspect-video bg-neutral-950 flex items-center justify-center overflow-hidden group select-none">
           <video
             ref={videoRef}
             autoPlay
@@ -488,52 +523,96 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
 
           {!isCameraActive && (
             <div className="text-center p-6 flex flex-col items-center">
-              <div className="w-14 h-14 rounded-2xl bg-neutral-900 border border-neutral-800 flex items-center justify-center text-neutral-500 mb-3 shadow-inner">
-                <Camera className="w-7 h-7" />
+              <div className="w-16 h-16 rounded-2xl bg-neutral-900 border border-neutral-800 flex items-center justify-center text-neutral-500 mb-3 shadow-inner">
+                <Camera className="w-8 h-8" />
               </div>
-              <p className="text-sm font-medium text-neutral-300">
+              <p className="text-base font-bold text-neutral-200">
                 Camera is currently inactive
               </p>
-              <p className="text-xs text-neutral-500 mt-1 max-w-xs leading-relaxed">
-                Press "Start Camera" to broadcast your physical camera, or "Simulate CCTV Stream" for instant testing.
+              <p className="text-xs text-neutral-400 mt-1 max-w-xs leading-relaxed">
+                Press "Start Physical Camera" to stream your webcam, or "Simulate CCTV Stream" for instant zero-permission testing.
               </p>
             </div>
           )}
 
-          {/* On-video badges when live */}
+          {/* On-video Tactical Overlays when active */}
           {isCameraActive && (
-            <div className="absolute top-3 left-3 right-3 flex items-center justify-between pointer-events-none">
-              <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/70 backdrop-blur-sm border border-white/10 text-xs font-semibold text-white">
-                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                {isVirtualMode ? 'VIRTUAL CCTV FEED' : 'LIVE CAMERA'}
+            <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-black/75 backdrop-blur-md border border-white/15 text-[11px] font-mono font-bold text-white shadow-lg">
+                  <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                  <span>REC</span>
+                </div>
+
+                <div className="px-2.5 py-1 rounded-md bg-black/75 backdrop-blur-md border border-emerald-500/30 text-[11px] font-mono font-bold text-emerald-400 shadow-lg">
+                  {cameraPreset}
+                </div>
               </div>
 
-              <div className="px-2.5 py-1 rounded-full bg-black/70 backdrop-blur-sm border border-white/10 text-xs font-mono text-neutral-300 flex items-center gap-1">
-                <Wifi className="w-3 h-3 text-emerald-400" />
-                {isVirtualMode ? 'Test HD' : facingMode === 'environment' ? 'Rear' : 'Front'}
+              {/* Bottom HUD */}
+              <div className="flex items-center justify-between text-[10px] font-mono text-neutral-300 bg-black/75 backdrop-blur-md border border-white/15 px-2.5 py-1 rounded-md">
+                <div className="flex items-center gap-2">
+                  <span className="text-emerald-400 font-bold">LIVE STREAM</span>
+                  <span>•</span>
+                  <span>{isVirtualMode ? 'SIMULATED HD' : facingMode === 'environment' ? 'REAR LENS' : 'FRONT LENS'}</span>
+                </div>
+                <div>{new Date().toISOString().split('T')[0]} {new Date().toLocaleTimeString()}</div>
               </div>
             </div>
           )}
         </div>
 
-        {/* Room Code & Share Section (When Active) */}
+        {/* Location Preset Selector (When Idle) */}
+        {!isCameraActive && (
+          <div className="p-4 bg-neutral-950 border-t border-b border-neutral-800">
+            <div className="text-xs font-bold uppercase tracking-wider text-neutral-400 mb-2 flex items-center gap-1.5">
+              <Layers className="w-3.5 h-3.5 text-emerald-400" />
+              Camera Location Preset
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {(
+                [
+                  'LIVING ROOM [CAM-01]',
+                  'FRONT DOOR [CAM-02]',
+                  'GARAGE & DRIVEWAY [CAM-03]',
+                  'NURSERY [CAM-04]',
+                ] as CameraPreset[]
+              ).map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() => setCameraPreset(preset)}
+                  className={`px-3 py-2 rounded-xl text-xs font-mono font-medium text-left border transition cursor-pointer ${
+                    cameraPreset === preset
+                      ? 'bg-emerald-950/60 border-emerald-500 text-emerald-200 shadow-sm'
+                      : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-neutral-200'
+                  }`}
+                >
+                  {preset}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Room Code & Sharing Card (When Active) */}
         {isCameraActive && roomCode && (
           <div className="p-4 bg-neutral-950 border-t border-b border-neutral-800">
             <div className="text-center mb-3">
               <div className="flex items-center justify-center gap-1.5 text-xs font-bold uppercase tracking-wider text-emerald-400 mb-1">
-                <Shield className="w-3.5 h-3.5" />
-                Your Monitor Code
+                <Shield className="w-4 h-4" />
+                6-Digit Monitor Access PIN
               </div>
               <p className="text-xs text-neutral-400">
-                Input this code on any phone in Monitor mode to watch your room live.
+                Input this code on the Monitor device to watch this camera live.
               </p>
             </div>
 
-            {/* 6-Digit Code Display */}
-            <div className="flex items-center justify-center gap-2">
+            {/* Code and Copy buttons */}
+            <div className="flex items-center justify-center gap-2 max-w-sm mx-auto">
               <div
                 id="room-code-display"
-                className="font-mono text-3xl sm:text-4xl font-extrabold tracking-widest text-emerald-400 bg-neutral-900 px-5 py-2 rounded-xl border border-emerald-500/40 shadow-inner"
+                className="font-mono text-3xl sm:text-4xl font-extrabold tracking-widest text-emerald-400 bg-neutral-900 px-6 py-2.5 rounded-2xl border-2 border-emerald-500/40 shadow-inner flex-1 text-center"
               >
                 {roomCode}
               </div>
@@ -541,7 +620,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
                 id="btn-copy-room-code"
                 type="button"
                 onClick={copyRoomCode}
-                className="p-3 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-neutral-200 transition cursor-pointer flex items-center justify-center"
+                className="p-3.5 rounded-2xl bg-neutral-800 hover:bg-neutral-700 text-neutral-200 transition cursor-pointer flex items-center justify-center border border-neutral-700 shadow"
                 title="Copy Room Code"
               >
                 {copiedCode ? (
@@ -552,13 +631,13 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
               </button>
             </div>
 
-            {/* Share Direct Link Button */}
-            <div className="mt-3 flex justify-center">
+            {/* Quick Testing & Link Sharing Deck */}
+            <div className="mt-3 flex flex-wrap items-center justify-center gap-2 pt-1">
               <button
                 id="btn-copy-monitor-link"
                 type="button"
                 onClick={copyMonitorLink}
-                className="px-3.5 py-2 rounded-xl bg-neutral-900 hover:bg-neutral-800 border border-neutral-700 text-xs font-semibold text-neutral-200 transition flex items-center gap-2 cursor-pointer"
+                className="px-3 py-1.5 rounded-xl bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-xs font-semibold text-neutral-300 transition flex items-center gap-1.5 cursor-pointer"
               >
                 {copiedLink ? (
                   <>
@@ -568,32 +647,43 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
                 ) : (
                   <>
                     <Share2 className="w-3.5 h-3.5 text-blue-400" />
-                    <span>Copy Direct Monitor Link</span>
+                    <span>Copy Monitor Link</span>
                   </>
                 )}
+              </button>
+
+              <button
+                id="btn-open-monitor-tab"
+                type="button"
+                onClick={openMonitorInNewTab}
+                className="px-3 py-1.5 rounded-xl bg-blue-600/20 hover:bg-blue-600/30 border border-blue-500/40 text-xs font-bold text-blue-300 transition flex items-center gap-1.5 cursor-pointer"
+                title="Open Monitor in New Tab with pre-filled code"
+              >
+                <ExternalLink className="w-3.5 h-3.5 text-blue-400" />
+                <span>Open Monitor Tab (Quick Test)</span>
               </button>
             </div>
           </div>
         )}
 
         {/* Status Indicators */}
-        <div className="p-4 space-y-2.5 bg-neutral-900 text-sm">
+        <div className="p-4 space-y-2 bg-neutral-900 text-sm">
           <div className="flex items-center justify-between py-1 border-b border-neutral-800/60">
-            <span className="text-neutral-400 font-medium">Camera Feed:</span>
+            <span className="text-neutral-400 font-medium">Broadcast Status:</span>
             <span
               id="status-camera-controller"
               className="font-semibold flex items-center gap-1.5"
             >
               {isCameraActive ? (
                 <>
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
                   <span className="text-emerald-400">
-                    {isVirtualMode ? 'Broadcasting (Virtual CCTV)' : 'Broadcasting (Live)'}
+                    {isVirtualMode ? 'Streaming Simulated Feed' : 'Streaming Hardware Camera'}
                   </span>
                 </>
               ) : (
                 <>
-                  <span className="w-2 h-2 rounded-full bg-neutral-600"></span>
+                  <span className="w-2 h-2 rounded-full bg-neutral-600" />
                   <span className="text-neutral-400">Inactive</span>
                 </>
               )}
@@ -601,32 +691,32 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
           </div>
 
           <div className="flex items-center justify-between py-1">
-            <span className="text-neutral-400 font-medium">Monitor Connection:</span>
+            <span className="text-neutral-400 font-medium">Remote Monitor:</span>
             <span
               id="status-monitor-controller"
               className="font-semibold flex items-center gap-1.5"
             >
               {isMonitorConnected ? (
                 <>
-                  <Eye className="w-4 h-4 text-emerald-400" />
-                  <span className="text-emerald-400 font-semibold">Monitor Watching Live</span>
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  <span className="text-emerald-400 font-semibold">Monitor Connected (Watching Live)</span>
                 </>
               ) : isCameraActive ? (
                 <>
-                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
-                  <span className="text-amber-300">Waiting for code entry...</span>
+                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                  <span className="text-amber-300">Awaiting PIN #{roomCode}...</span>
                 </>
               ) : (
                 <>
-                  <span className="w-2 h-2 rounded-full bg-neutral-600"></span>
-                  <span className="text-neutral-400">Not Connected</span>
+                  <span className="w-2 h-2 rounded-full bg-neutral-600" />
+                  <span className="text-neutral-400">Standby</span>
                 </>
               )}
             </span>
           </div>
         </div>
 
-        {/* Action Controls */}
+        {/* Primary Action Controls */}
         <div className="p-4 pt-0 space-y-2.5">
           {!isCameraActive ? (
             <div className="space-y-2">
@@ -638,13 +728,13 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
                 className="w-full py-3.5 px-4 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-neutral-950 font-bold text-base transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-950/40 disabled:opacity-50 cursor-pointer"
               >
                 <Video className="w-5 h-5" />
-                {isStarting ? 'Accessing Camera...' : 'Start Physical Camera'}
+                {isStarting ? 'Initializing Camera...' : 'Start Physical Camera'}
               </button>
 
               <button
                 id="btn-start-virtual"
                 type="button"
-                onClick={startVirtualCCTV}
+                onClick={() => startVirtualCCTV()}
                 disabled={isStarting}
                 className="w-full py-2.5 px-4 rounded-xl bg-neutral-950 hover:bg-neutral-800 text-neutral-300 font-semibold text-xs sm:text-sm border border-neutral-700 transition flex items-center justify-center gap-2 cursor-pointer"
               >
@@ -653,7 +743,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
               </button>
             </div>
           ) : (
-            <div className="space-y-2.5">
+            <div className="space-y-2">
               {!isVirtualMode && (
                 <button
                   id="btn-switch-camera"
@@ -682,4 +772,3 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
     </div>
   );
 };
-
