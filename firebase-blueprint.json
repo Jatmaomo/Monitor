@@ -1,0 +1,50 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Registered user profile information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "fullName": { "type": "string" },
+        "email": { "type": "string" },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["uid", "fullName", "email", "createdAt"]
+    },
+    "Room": {
+      "title": "Room",
+      "description": "Active camera room pairing and WebRTC signaling session",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "controllerId": { "type": "string" },
+        "controllerName": { "type": "string" },
+        "status": { "type": "string", "enum": ["waiting", "connected", "disconnected"] },
+        "monitorId": { "type": "string" },
+        "monitorName": { "type": "string" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id", "controllerId", "status", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile documents keyed by Firebase Auth UID"
+    },
+    "/rooms/{roomId}": {
+      "schema": "Room",
+      "description": "Camera pairing room documents keyed by 6-digit room code"
+    },
+    "/rooms/{roomId}/controllerCandidates/{candidateId}": {
+      "schema": "object",
+      "description": "WebRTC ICE candidates sent from Controller camera phone"
+    },
+    "/rooms/{roomId}/monitorCandidates/{candidateId}": {
+      "schema": "object",
+      "description": "WebRTC ICE candidates sent from Monitor viewer phone"
+    }
+  }
+}

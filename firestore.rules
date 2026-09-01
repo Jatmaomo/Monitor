@@ -1,0 +1,28 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // User profiles
+    match /users/{userId} {
+      allow read, write: if true;
+    }
+
+    // Accounts for persistent credential verification
+    match /accounts/{accountEmail} {
+      allow read, write: if true;
+    }
+    
+    // Room pairing and WebRTC signaling for CCTV stream
+    match /rooms/{roomId} {
+      allow read, write: if true;
+      
+      match /controllerCandidates/{candidateId} {
+        allow read, write: if true;
+      }
+      
+      match /monitorCandidates/{candidateId} {
+        allow read, write: if true;
+      }
+    }
+  }
+}
