@@ -1,15 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import {
-  doc,
-  getDoc,
-  updateDoc,
-  collection,
-  addDoc,
-  onSnapshot,
-} from 'firebase/firestore';
-import { db } from '../firebase';
-import { UserProfile, RoomData } from '../types';
+import { UserProfile } from '../types';
 import { rtcConfiguration } from '../lib/webrtc';
+import { signaling } from '../lib/signaling';
 import {
   Tv,
   Radio,
@@ -19,74 +11,35 @@ import {
   AlertCircle,
   Maximize2,
   Minimize2,
-  Camera,
-  Play,
-  Signal,
+  KeyRound,
+  ShieldCheck,
 } from 'lucide-react';
 
 interface MonitorModeProps {
   user: UserProfile;
+  initialRoomCode?: string;
 }
 
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'lost';
 
-export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
-  const [roomCodeInput, setRoomCodeInput] = useState('');
+export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode }) => {
+  const [roomCodeInput, setRoomCodeInput] = useState(initialRoomCode || '');
   const [activeRoomCode, setActiveRoomCode] = useState<string | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionState>('idle');
   const [isCameraLive, setIsCameraLive] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [discoveredCameras, setDiscoveredCameras] = useState<RoomData[]>([]);
   const [fallbackFrame, setFallbackFrame] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const videoContainerRef = useRef<HTMLDivElement | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
-  const unsubscribeRoomRef = useRef<(() => void) | null>(null);
-  const unsubscribeCandidatesRef = useRef<(() => void) | null>(null);
   const candidateQueueRef = useRef<RTCIceCandidateInit[]>([]);
   const isRemoteDescriptionSetRef = useRef<boolean>(false);
 
-  // Auto-discover active Controller cameras from Firestore backend in real-time
-  useEffect(() => {
-    const unsubscribeRoomsList = onSnapshot(
-      collection(db, 'rooms'),
-      (snapshot) => {
-        const now = Date.now();
-        const activeRooms: RoomData[] = [];
-        snapshot.forEach((docSnap) => {
-          const data = docSnap.data() as RoomData;
-          const isRecentlyActive =
-            data.status !== 'disconnected' &&
-            (now - (data.lastHeartbeat || data.updatedAt || data.createdAt) < 45000);
-          if (isRecentlyActive) {
-            activeRooms.push({
-              ...data,
-              id: docSnap.id,
-            });
-          }
-        });
-        setDiscoveredCameras(activeRooms);
-      },
-      (err) => {
-        console.warn('Rooms discovery listener warning:', err);
-      }
-    );
-
-    return () => unsubscribeRoomsList();
-  }, []);
-
-  // Cleanly disconnect WebRTC and Firestore listeners
+  // Cleanly disconnect WebRTC and backend listeners
   const disconnect = useCallback(async () => {
-    if (unsubscribeRoomRef.current) {
-      unsubscribeRoomRef.current();
-      unsubscribeRoomRef.current = null;
-    }
-    if (unsubscribeCandidatesRef.current) {
-      unsubscribeCandidatesRef.current();
-      unsubscribeCandidatesRef.current = null;
-    }
+    signaling.closeStream();
 
     if (peerConnectionRef.current) {
       try {
@@ -101,27 +54,13 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
       videoRef.current.srcObject = null;
     }
 
-    if (activeRoomCode) {
-      try {
-        await updateDoc(doc(db, 'rooms', activeRoomCode), {
-          status: 'waiting',
-          monitorId: null,
-          monitorName: null,
-          answer: null,
-          updatedAt: Date.now(),
-        });
-      } catch (err) {
-        console.warn('Error updating room doc on monitor disconnect:', err);
-      }
-    }
-
     isRemoteDescriptionSetRef.current = false;
     candidateQueueRef.current = [];
     setFallbackFrame(null);
     setConnectionStatus('idle');
     setIsCameraLive(false);
     setActiveRoomCode(null);
-  }, [activeRoomCode]);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -129,10 +68,10 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
     };
   }, [disconnect]);
 
-  const connectToRoom = async (codeToConnect?: string) => {
-    const code = (codeToConnect || roomCodeInput).trim();
-    if (!code) {
-      setErrorMessage('Please enter or select a 6-digit Room Code.');
+  const connectToRoom = useCallback(async (codeToConnect?: string) => {
+    const raw = (codeToConnect || roomCodeInput).trim().replace(/\D/g, '');
+    if (!raw || raw.length !== 6) {
+      setErrorMessage('Please enter a valid 6-digit Controller Code.');
       return;
     }
 
@@ -143,24 +82,22 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
     candidateQueueRef.current = [];
 
     try {
-      // 1. Fetch Room from Firestore Backend
-      const roomDocRef = doc(db, 'rooms', code);
-      const roomSnap = await getDoc(roomDocRef);
+      // 1. Fetch Room from Backend
+      const roomData = await signaling.getRoom(raw);
 
-      if (!roomSnap.exists()) {
-        throw new Error('Room Code not found. Please check the code and ensure Controller camera is live.');
+      if (!roomData) {
+        throw new Error(`Room "${raw}" not found. Please verify the code on the Controller device.`);
       }
 
-      const roomData = roomSnap.data() as RoomData;
       if (roomData.status === 'disconnected' || !roomData.offer) {
-        throw new Error('Controller camera is not currently active for this room.');
+        throw new Error(`Controller camera for room "${raw}" is currently offline.`);
       }
 
       if (roomData.lastFrame) {
         setFallbackFrame(roomData.lastFrame);
       }
 
-      setActiveRoomCode(code);
+      setActiveRoomCode(raw);
 
       // 2. Create RTCPeerConnection
       const pc = new RTCPeerConnection(rtcConfiguration);
@@ -185,12 +122,9 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
       pc.onicecandidate = async (event) => {
         if (event.candidate) {
           try {
-            await addDoc(
-              collection(db, 'rooms', code, 'monitorCandidates'),
-              event.candidate.toJSON()
-            );
+            await signaling.sendCandidate(raw, 'monitor', event.candidate.toJSON());
           } catch (err) {
-            console.warn('Error adding monitor candidate:', err);
+            console.warn('Error sending monitor candidate:', err);
           }
         }
       };
@@ -244,62 +178,60 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
         }
       }
 
-      // 4. Create Answer
+      // Add already collected controller candidates
+      if (roomData.controllerCandidates && roomData.controllerCandidates.length > 0) {
+        for (const c of roomData.controllerCandidates) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(c));
+          } catch (e) {
+            console.warn('Error adding existing controller candidate:', e);
+          }
+        }
+      }
+
+      // 4. Create WebRTC Answer
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
 
-      // 5. Update Firestore Room with Answer
-      await updateDoc(roomDocRef, {
-        answer: {
+      // 5. Send Answer to Backend
+      await signaling.sendAnswer(
+        raw,
+        {
           type: answer.type,
           sdp: answer.sdp,
         },
-        monitorId: user.uid,
-        monitorName: user.fullName || 'Monitor Phone',
-        status: 'connected',
-        updatedAt: Date.now(),
-      });
-
-      // 6. Listen to Controller ICE Candidates
-      const unsubscribeCandidates = onSnapshot(
-        collection(db, 'rooms', code, 'controllerCandidates'),
-        (snapshot) => {
-          snapshot.docChanges().forEach(async (change) => {
-            if (change.type === 'added') {
-              const candidateData = change.doc.data() as RTCIceCandidateInit;
-              if (isRemoteDescriptionSetRef.current && pc.remoteDescription) {
-                try {
-                  await pc.addIceCandidate(new RTCIceCandidate(candidateData));
-                } catch (err) {
-                  console.warn('Error adding controller candidate:', err);
-                }
-              } else {
-                candidateQueueRef.current.push(candidateData);
-              }
-            }
-          });
-        }
+        user.uid,
+        user.fullName || 'Monitor Phone'
       );
-      unsubscribeCandidatesRef.current = unsubscribeCandidates;
 
-      // 7. Listen for Room status updates & real-time frame relay
-      const unsubscribeRoom = onSnapshot(roomDocRef, (snapshot) => {
-        const data = snapshot.data() as RoomData | undefined;
-        if (!data || data.status === 'disconnected') {
-          setConnectionStatus('lost');
-          setIsCameraLive(false);
-        } else {
-          if (data.lastFrame) {
-            setFallbackFrame(data.lastFrame);
+      // 6. Subscribe to Controller Candidates & Stream updates via SSE
+      signaling.subscribeToRoom(raw, {
+        onControllerCandidate: async (candidateData) => {
+          if (isRemoteDescriptionSetRef.current && pc.remoteDescription) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(candidateData));
+            } catch (err) {
+              console.warn('Error adding controller candidate:', err);
+            }
+          } else {
+            candidateQueueRef.current.push(candidateData);
+          }
+        },
+        onFrame: (data) => {
+          if (data.frame) {
+            setFallbackFrame(data.frame);
             setIsCameraLive(true);
             setConnectionStatus('connected');
           }
-        }
+        },
+        onDisconnected: () => {
+          setConnectionStatus('lost');
+          setIsCameraLive(false);
+        },
       });
-      unsubscribeRoomRef.current = unsubscribeRoom;
     } catch (err: any) {
       console.error('Failed to connect to room:', err);
-      setErrorMessage(err.message || 'Failed to connect to Controller. Please check the code.');
+      setErrorMessage(err.message || 'Failed to connect. Please check the 6-digit code and ensure Controller camera is running.');
       setConnectionStatus('idle');
       if (peerConnectionRef.current) {
         try {
@@ -310,12 +242,19 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
         peerConnectionRef.current = null;
       }
     }
-  };
+  }, [roomCodeInput, user.uid, user.fullName, fallbackFrame]);
+
+  // Auto-connect if initialRoomCode is passed via direct URL
+  useEffect(() => {
+    if (initialRoomCode && initialRoomCode.trim().length === 6) {
+      connectToRoom(initialRoomCode.trim());
+    }
+  }, [initialRoomCode, connectToRoom]);
 
   const handleReconnect = () => {
     if (activeRoomCode) {
       connectToRoom(activeRoomCode);
-    } else if (roomCodeInput.trim()) {
+    } else if (roomCodeInput.trim().length === 6) {
       connectToRoom(roomCodeInput.trim());
     }
   };
@@ -351,79 +290,12 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
         </div>
       )}
 
-      {/* Discovered Cameras Backend List (When Idle) */}
-      {connectionStatus === 'idle' && (
-        <div className="mb-4 bg-neutral-900 border border-neutral-800 rounded-2xl p-4 shadow-lg">
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-xs font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
-              <Signal className="w-3.5 h-3.5 animate-pulse" />
-              Discovered Live Cameras ({discoveredCameras.length})
-            </span>
-            <span className="text-[11px] text-neutral-500 font-mono">Real-Time Backend</span>
-          </div>
-
-          {discoveredCameras.length > 0 ? (
-            <div className="space-y-2">
-              {discoveredCameras.map((cam) => (
-                <div
-                  key={cam.id}
-                  className="p-3 rounded-xl bg-neutral-950 border border-neutral-800 hover:border-emerald-500/50 transition flex items-center justify-between"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="w-9 h-9 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 flex items-center justify-center">
-                      <Camera className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <div className="text-sm font-semibold text-neutral-200">
-                        {cam.cameraLabel || cam.controllerName || 'Camera Phone'}
-                      </div>
-                      <div className="text-xs text-neutral-400 flex items-center gap-1.5 mt-0.5">
-                        <span className="font-mono text-emerald-400 font-bold tracking-wider">
-                          Code: {cam.id}
-                        </span>
-                        <span>&bull;</span>
-                        <span className="text-emerald-400 flex items-center gap-1 text-[11px]">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                          Online
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setRoomCodeInput(cam.id);
-                      connectToRoom(cam.id);
-                    }}
-                    className="py-1.5 px-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs transition flex items-center gap-1.5 cursor-pointer shadow-md shadow-blue-950/40"
-                  >
-                    <Play className="w-3 h-3 fill-current" />
-                    Watch
-                  </button>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="text-center py-4 px-2 rounded-xl bg-neutral-950 border border-neutral-800/80">
-              <Camera className="w-5 h-5 text-neutral-600 mx-auto mb-1.5" />
-              <p className="text-xs text-neutral-400">
-                No cameras currently broadcasting.
-              </p>
-              <p className="text-[11px] text-neutral-500 mt-0.5">
-                Open Controller mode on another phone or enter a 6-digit code below.
-              </p>
-            </div>
-          )}
-        </div>
-      )}
-
       {/* Main Viewer Card */}
       <div className="bg-neutral-900 border border-neutral-800 rounded-2xl overflow-hidden shadow-xl">
         {/* Remote Live Video Display */}
         <div
           ref={videoContainerRef}
-          className="relative aspect-video sm:aspect-4/3 bg-neutral-950 flex items-center justify-center overflow-hidden group"
+          className="relative aspect-video sm:aspect-4/3 bg-neutral-950 flex items-center justify-center overflow-hidden"
         >
           <video
             ref={videoRef}
@@ -435,18 +307,18 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
             }`}
           />
 
-          {/* Fallback image relay if peer-to-peer WebRTC video stream is negotiating */}
+          {/* Real-time frame relay */}
           {connectionStatus === 'connected' && isCameraLive && fallbackFrame && (
             <img
               src={fallbackFrame}
-              alt="Live Camera Relay"
+              alt="Live Camera Feed"
               className={`w-full h-full object-contain bg-black absolute inset-0 ${
                 videoRef.current?.srcObject ? 'hidden' : ''
               }`}
             />
           )}
 
-          {/* Fallback States when not live */}
+          {/* Non-live States */}
           {(connectionStatus !== 'connected' || !isCameraLive) && (
             <div className="text-center p-6 flex flex-col items-center">
               <div className="w-14 h-14 rounded-2xl bg-neutral-900 border border-neutral-800 flex items-center justify-center text-neutral-500 mb-3">
@@ -454,29 +326,29 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
               </div>
               {connectionStatus === 'connecting' ? (
                 <div>
-                  <p className="text-sm font-semibold text-emerald-400 animate-pulse">
-                    Connecting to Controller...
+                  <p className="text-sm font-semibold text-blue-400 animate-pulse">
+                    Connecting to Controller Phone...
                   </p>
                   <p className="text-xs text-neutral-500 mt-1">
-                    Establishing real-time peer-to-peer video stream via backend signaling
+                    Verifying code and establishing live video stream.
                   </p>
                 </div>
               ) : connectionStatus === 'lost' ? (
                 <div>
                   <p className="text-sm font-semibold text-red-400">
-                    Connection Lost
+                    Connection Ended
                   </p>
                   <p className="text-xs text-neutral-500 mt-1">
-                    The camera feed was interrupted or stopped by the Controller.
+                    The Controller camera was stopped or the room disconnected.
                   </p>
                 </div>
               ) : (
                 <div>
                   <p className="text-sm font-medium text-neutral-300">
-                    No active video feed
+                    Enter Controller Code Below
                   </p>
                   <p className="text-xs text-neutral-500 mt-1 max-w-xs">
-                    Select a camera above or enter the 6-digit room code below.
+                    Input the 6-digit code shown on the Controller device to watch its live camera.
                   </p>
                 </div>
               )}
@@ -485,16 +357,16 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
 
           {/* On-Video Badges when live */}
           {connectionStatus === 'connected' && isCameraLive && (
-            <div className="absolute top-3 left-3 right-3 flex items-center justify-between">
+            <div className="absolute top-3 left-3 right-3 flex items-center justify-between pointer-events-none">
               <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/70 backdrop-blur-sm border border-white/10 text-xs font-semibold text-white">
                 <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                LIVE FEED
+                LIVE HOME FEED
               </div>
 
               <button
                 type="button"
                 onClick={toggleFullscreen}
-                className="p-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-white hover:bg-black/90 transition cursor-pointer"
+                className="p-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-white hover:bg-black/90 transition pointer-events-auto cursor-pointer"
                 title="Toggle Fullscreen"
               >
                 {isFullscreen ? (
@@ -507,36 +379,50 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
           )}
         </div>
 
-        {/* Manual Pairing Code Input (When Idle) */}
+        {/* 6-Digit Code Input Section (When Idle) */}
         {connectionStatus === 'idle' && (
-          <div className="p-4 bg-neutral-950/80 border-t border-b border-neutral-800">
-            <label
-              htmlFor="monitor-room-code-input"
-              className="block text-xs font-semibold uppercase tracking-wider text-neutral-400 mb-1.5 text-center"
-            >
-              Or Enter 6-Digit Room Code Manually
-            </label>
-            <input
-              id="monitor-room-code-input"
-              type="text"
-              inputMode="numeric"
-              pattern="[0-9]*"
-              maxLength={6}
-              value={roomCodeInput}
-              onChange={(e) =>
-                setRoomCodeInput(e.target.value.replace(/[^0-9]/g, ''))
-              }
-              placeholder="e.g. 482913"
-              className="w-full text-center font-mono text-2xl font-bold tracking-widest px-4 py-2.5 rounded-xl bg-neutral-900 border border-neutral-700 text-neutral-100 placeholder-neutral-600 focus:outline-none focus:border-blue-500"
-            />
+          <div className="p-5 bg-neutral-950 border-t border-b border-neutral-800">
+            <div className="text-center mb-3">
+              <label
+                htmlFor="monitor-room-code-input"
+                className="inline-flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-neutral-300 mb-1"
+              >
+                <KeyRound className="w-4 h-4 text-blue-400" />
+                Enter 6-Digit Controller Code
+              </label>
+              <p className="text-xs text-neutral-500">
+                Input the code displayed on your home camera phone.
+              </p>
+            </div>
+
+            <div className="max-w-xs mx-auto">
+              <input
+                id="monitor-room-code-input"
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                maxLength={6}
+                value={roomCodeInput}
+                onChange={(e) => {
+                  const cleaned = e.target.value.replace(/[^0-9]/g, '');
+                  setRoomCodeInput(cleaned);
+                  if (cleaned.length === 6) {
+                    connectToRoom(cleaned);
+                  }
+                }}
+                placeholder="------"
+                className="w-full text-center font-mono text-3xl font-extrabold tracking-widest px-4 py-3 rounded-xl bg-neutral-900 border-2 border-neutral-700 text-neutral-100 placeholder-neutral-700 focus:outline-none focus:border-blue-500 shadow-inner"
+              />
+            </div>
           </div>
         )}
 
-        {/* Room Code Display during active connection */}
+        {/* Active Connected Room Banner */}
         {connectionStatus !== 'idle' && activeRoomCode && (
-          <div className="px-4 py-2.5 bg-neutral-950/60 border-t border-b border-neutral-800 text-center flex items-center justify-center gap-2">
-            <span className="text-xs text-neutral-400">
-              Connected to Room: <strong className="font-mono text-emerald-400 font-bold text-sm tracking-wider">{activeRoomCode}</strong>
+          <div className="px-4 py-2.5 bg-neutral-950/80 border-t border-b border-neutral-800 text-center flex items-center justify-center gap-2">
+            <ShieldCheck className="w-4 h-4 text-emerald-400" />
+            <span className="text-xs text-neutral-300">
+              Monitoring Room: <strong className="font-mono text-emerald-400 font-bold text-sm tracking-wider">{activeRoomCode}</strong>
             </span>
           </div>
         )}
@@ -561,8 +447,8 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
                 </>
               ) : connectionStatus === 'connecting' ? (
                 <>
-                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
-                  <span className="text-amber-300">Connecting...</span>
+                  <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
+                  <span className="text-blue-300">Connecting...</span>
                 </>
               ) : (
                 <>
@@ -582,40 +468,40 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
               {connectionStatus === 'connected' ? (
                 <>
                   <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                  <span className="text-emerald-400">Connected</span>
+                  <span className="text-emerald-400">Paired with Code</span>
                 </>
               ) : connectionStatus === 'lost' ? (
                 <>
                   <span className="w-2 h-2 rounded-full bg-red-500"></span>
-                  <span className="text-red-400">Connection Lost</span>
+                  <span className="text-red-400">Offline</span>
                 </>
               ) : connectionStatus === 'connecting' ? (
                 <>
-                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
-                  <span className="text-amber-300">Pairing...</span>
+                  <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
+                  <span className="text-blue-300">Authenticating Code...</span>
                 </>
               ) : (
                 <>
                   <span className="w-2 h-2 rounded-full bg-neutral-600"></span>
-                  <span className="text-neutral-400">Not Connected</span>
+                  <span className="text-neutral-400">Enter Code</span>
                 </>
               )}
             </span>
           </div>
         </div>
 
-        {/* Action Buttons */}
+        {/* Actions */}
         <div className="p-4 pt-0 space-y-2.5">
           {connectionStatus === 'idle' && (
             <button
               id="btn-connect-monitor"
               type="button"
               onClick={() => connectToRoom()}
-              disabled={roomCodeInput.trim().length === 0}
+              disabled={roomCodeInput.trim().length !== 6}
               className="w-full py-3.5 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-base transition flex items-center justify-center gap-2 shadow-lg shadow-blue-950/40 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             >
               <Plug className="w-5 h-5" />
-              Connect with Code
+              Watch Live Feed
             </button>
           )}
 
@@ -638,7 +524,7 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
               className="w-full py-3.5 px-4 rounded-xl bg-red-600 hover:bg-red-500 text-white font-bold text-base transition flex items-center justify-center gap-2 shadow-lg shadow-red-950/40 cursor-pointer"
             >
               <Unplug className="w-5 h-5" />
-              Disconnect
+              Stop Watching
             </button>
           )}
 
@@ -648,10 +534,10 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
                 id="btn-reconnect-monitor"
                 type="button"
                 onClick={handleReconnect}
-                className="w-full py-3.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-base transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-950/40 cursor-pointer"
+                className="w-full py-3.5 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-base transition flex items-center justify-center gap-2 shadow-lg shadow-blue-950/40 cursor-pointer"
               >
                 <RefreshCw className="w-5 h-5" />
-                Reconnect
+                Retry Connection
               </button>
 
               <button
@@ -660,7 +546,7 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user }) => {
                 onClick={disconnect}
                 className="w-full py-2.5 px-4 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-neutral-300 font-medium text-sm border border-neutral-700 transition cursor-pointer"
               >
-                Enter Different Room Code
+                Enter Different Code
               </button>
             </div>
           )}
