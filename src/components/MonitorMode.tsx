@@ -24,6 +24,7 @@ import {
   Download,
   History,
   CheckCircle2,
+  SwitchCamera,
 } from 'lucide-react';
 
 interface MonitorModeProps {
@@ -321,35 +322,54 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
         );
       }
 
-      // 4. Subscribe to Real-Time SSE Stream
-      signaling.subscribeToRoom(raw, {
-        onControllerCandidate: async (candidateData) => {
-          const pc = peerConnectionRef.current;
-          if (pc && isRemoteDescriptionSetRef.current && pc.remoteDescription) {
-            try {
-              await pc.addIceCandidate(new RTCIceCandidate(candidateData));
-            } catch (err) {
-              console.warn('Error adding controller candidate:', err);
+      // 4. Subscribe to Real-Time WebSocket Channel & SSE Fallback
+      signaling.connectWs(
+        raw,
+        'monitor',
+        {
+          onInit: (room) => {
+            if (room.lastFrame) {
+              setActiveFrame(room.lastFrame);
+              setIsCameraLive(true);
+              setConnectionStatus('connected');
+              lastFrameTimeRef.current = Date.now();
             }
-          } else {
-            candidateQueueRef.current.push(candidateData);
-          }
+            if (room.cameraName) {
+              setCameraLabel(room.cameraName);
+            }
+          },
+          onControllerCandidate: async (candidateData) => {
+            const pc = peerConnectionRef.current;
+            if (pc && isRemoteDescriptionSetRef.current && pc.remoteDescription) {
+              try {
+                await pc.addIceCandidate(new RTCIceCandidate(candidateData));
+              } catch (err) {
+                console.warn('Error adding controller candidate:', err);
+              }
+            } else {
+              candidateQueueRef.current.push(candidateData);
+            }
+          },
+          onFrame: (data) => {
+            if (data?.frame) {
+              setActiveFrame(data.frame);
+              if (data.cameraName) {
+                setCameraLabel(data.cameraName);
+              }
+              setIsCameraLive(true);
+              setConnectionStatus('connected');
+              lastFrameTimeRef.current = Date.now();
+            }
+          },
+          onDisconnected: () => {
+            addLog('Controller broadcast disconnected', 'warning');
+            setConnectionStatus('lost');
+            setIsCameraLive(false);
+            setHasWebRTCVideo(false);
+          },
         },
-        onFrame: (data) => {
-          if (data?.frame) {
-            setActiveFrame(data.frame);
-            setIsCameraLive(true);
-            setConnectionStatus('connected');
-            lastFrameTimeRef.current = Date.now();
-          }
-        },
-        onDisconnected: () => {
-          addLog('Controller broadcast disconnected', 'warning');
-          setConnectionStatus('lost');
-          setIsCameraLive(false);
-          setHasWebRTCVideo(false);
-        },
-      });
+        { uid: user.uid, fullName: user.fullName }
+      );
 
       setConnectionStatus('connected');
       setIsCameraLive(true);
@@ -432,8 +452,11 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
     }
   };
 
-  // Sound Siren / Alert Tone Generator
+  // Sound Siren / Alert Tone Generator and Remote Siren Trigger
   const triggerAudioSiren = () => {
+    if (activeRoomCode) {
+      signaling.sendControlCommand(activeRoomCode, 'alarm');
+    }
     try {
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const osc = audioCtx.createOscillator();
@@ -455,9 +478,17 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
 
       setIsAudioAlertActive(true);
       setTimeout(() => setIsAudioAlertActive(false), 1000);
-      addLog('Surveillance Attention Beep Broadcasted', 'warning');
+      addLog('Surveillance Attention Siren Dispatched to Camera', 'warning');
     } catch (err) {
       console.warn('Audio tone synthesis error:', err);
+    }
+  };
+
+  // Remote Camera Switch (Rear / Front)
+  const triggerRemoteCameraSwitch = () => {
+    if (activeRoomCode) {
+      signaling.sendControlCommand(activeRoomCode, 'switchCamera');
+      addLog('Remote Camera Switch command sent', 'info');
     }
   };
 
@@ -539,12 +570,12 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
             playsInline
             muted
             className={`w-full h-full object-contain bg-black transition-transform duration-200 ${getFilterStyle()} ${
-              connectionStatus === 'connected' && isCameraLive && hasWebRTCVideo ? 'block' : 'hidden'
+              connectionStatus === 'connected' && isCameraLive && hasWebRTCVideo ? 'block z-10' : 'hidden'
             }`}
             style={{ transform: `scale(${zoomLevel})` }}
           />
 
-          {/* Real-time Fast JPEG Frame Relay (Instant Backup & Primary Stream) */}
+          {/* Real-time Fast Frame Relay (Always shows camera frame immediately) */}
           {connectionStatus === 'connected' && isCameraLive && activeFrame && !hasWebRTCVideo && (
             <img
               src={activeFrame}
@@ -731,9 +762,19 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, initialRoomCode 
                 type="button"
                 onClick={triggerAudioSiren}
                 className="p-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-amber-400 transition cursor-pointer"
-                title="Trigger Alert Sound"
+                title="Trigger Remote Camera Siren"
               >
                 <Bell className={`w-4 h-4 ${isAudioAlertActive ? 'animate-bounce text-red-400' : ''}`} />
+              </button>
+
+              {/* Remote Camera Flip / Switch Button */}
+              <button
+                type="button"
+                onClick={triggerRemoteCameraSwitch}
+                className="p-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-neutral-300 hover:text-white transition cursor-pointer"
+                title="Remote Switch Camera (Front / Rear)"
+              >
+                <SwitchCamera className="w-4 h-4" />
               </button>
 
               {/* Snapshot Button */}

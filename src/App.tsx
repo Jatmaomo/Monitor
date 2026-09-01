@@ -31,7 +31,7 @@ export default function App() {
     }
   }, []);
 
-  // Check for existing session
+  // Check for existing session or auto-provision guest for direct room links
   useEffect(() => {
     const checkSession = () => {
       const stored = localStorage.getItem('myhy_user');
@@ -40,11 +40,31 @@ export default function App() {
           const parsed = JSON.parse(stored);
           if (parsed && parsed.uid) {
             setUser(parsed);
+            setLoading(false);
+            return;
           }
         } catch {
           // ignore
         }
       }
+
+      // If user arrived via direct room code link or QR code, auto-create guest session
+      try {
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.get('room') || urlParams.get('role')) {
+          const guestUser: UserProfile = {
+            uid: 'usr_' + Math.random().toString(36).substring(2, 10),
+            fullName: 'Security Monitor',
+            email: 'guest@jatmaomo.local',
+            createdAt: Date.now(),
+          };
+          localStorage.setItem('myhy_user', JSON.stringify(guestUser));
+          setUser(guestUser);
+        }
+      } catch {
+        // ignore
+      }
+
       setLoading(false);
     };
 

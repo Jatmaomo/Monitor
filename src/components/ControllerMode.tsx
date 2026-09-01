@@ -184,27 +184,54 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
       const ctx = canvas.getContext('2d');
       if (!ctx) return null;
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      return canvas.toDataURL('image/jpeg', 0.50);
+      return canvas.toDataURL('image/jpeg', 0.52);
     } catch {
       return null;
     }
   }, []);
 
-  // Frame streaming loop: single in-flight request at all times
+  // Audible security siren synthesizer
+  const playSirenAlarm = useCallback(() => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sawtooth';
+      gain.gain.setValueAtTime(0.3, ctx.currentTime);
+
+      const now = ctx.currentTime;
+      osc.frequency.setValueAtTime(600, now);
+      osc.frequency.exponentialRampToValueAtTime(1200, now + 0.25);
+      osc.frequency.exponentialRampToValueAtTime(600, now + 0.5);
+      osc.frequency.exponentialRampToValueAtTime(1200, now + 0.75);
+      osc.frequency.exponentialRampToValueAtTime(600, now + 1.0);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 1.2);
+    } catch (e) {
+      console.warn('Siren audio note:', e);
+    }
+  }, []);
+
+  // Frame streaming loop: single in-flight WebSocket / HTTP broadcast at high frame rate
   const startFrameStreamingLoop = useCallback(() => {
     isBroadcastingRef.current = true;
-    const run = async () => {
+    const run = () => {
       if (!isBroadcastingRef.current || !currentRoomCodeRef.current) return;
       const frame = captureFrame();
       if (frame && currentRoomCodeRef.current) {
-        await signaling.sendFrame(currentRoomCodeRef.current, frame);
+        signaling.sendWsFrame(currentRoomCodeRef.current, frame, cameraPreset);
       }
       if (isBroadcastingRef.current) {
-        frameTimeoutRef.current = setTimeout(run, 130);
+        frameTimeoutRef.current = setTimeout(run, 80); // ~12-15 FPS real-time
       }
     };
     run();
-  }, [captureFrame]);
+  }, [captureFrame, cameraPreset]);
 
   // Core stream initialization shared between real camera and virtual CCTV stream
   const initializeBroadcasting = async (stream: MediaStream, isVirtual: boolean, locationLabel: string) => {
@@ -243,7 +270,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
         const candidateJson = event.candidate.toJSON();
         if (isRoomCreatedRef.current) {
           try {
-            await signaling.sendCandidate(currentRoomCodeRef.current, 'controller', candidateJson);
+            signaling.sendWsCandidate(currentRoomCodeRef.current, 'controller', candidateJson);
           } catch (err) {
             console.warn('Error sending controller candidate:', err);
           }
@@ -275,7 +302,7 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
 
     const initialFrame = captureFrame();
 
-    // Store room and offer in Backend Server
+    // Store room and offer in Backend Server via REST API
     await signaling.createRoom(
       newRoomCode,
       user.uid,
@@ -290,55 +317,70 @@ export const ControllerMode: React.FC<ControllerModeProps> = ({ user }) => {
 
     isRoomCreatedRef.current = true;
 
+    // Connect WebSocket Channel for ultra-low latency frame & control streaming
+    signaling.connectWs(
+      newRoomCode,
+      'controller',
+      {
+        onAnswer: async (data) => {
+          if (data?.answer && !isRemoteDescriptionSetRef.current && pc.signalingState !== 'stable') {
+            try {
+              const answer = new RTCSessionDescription(data.answer);
+              await pc.setRemoteDescription(answer);
+              isRemoteDescriptionSetRef.current = true;
+              setIsMonitorConnected(true);
+
+              // Flush queued candidates
+              while (candidateQueueRef.current.length > 0) {
+                const cand = candidateQueueRef.current.shift();
+                if (cand) {
+                  try {
+                    await pc.addIceCandidate(new RTCIceCandidate(cand));
+                  } catch (e) {
+                    console.warn('Error adding queued candidate:', e);
+                  }
+                }
+              }
+            } catch (err) {
+              console.error('Error setting remote description from answer:', err);
+            }
+          }
+        },
+        onMonitorCandidate: async (candidateData) => {
+          if (isRemoteDescriptionSetRef.current && pc.remoteDescription) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(candidateData));
+            } catch (err) {
+              console.warn('Error adding monitor candidate:', err);
+            }
+          } else {
+            candidateQueueRef.current.push(candidateData);
+          }
+        },
+        onMonitorJoined: () => {
+          setIsMonitorConnected(true);
+        },
+        onControl: (data) => {
+          if (data.command === 'alarm') {
+            playSirenAlarm();
+          } else if (data.command === 'switchCamera') {
+            handleSwitchCamera();
+          }
+        },
+      },
+      { uid: user.uid, fullName: user.fullName }
+    );
+
     // Flush any candidates gathered during offer creation
     for (const cand of pendingControllerCandidates) {
       try {
-        await signaling.sendCandidate(newRoomCode, 'controller', cand);
+        signaling.sendWsCandidate(newRoomCode, 'controller', cand);
       } catch (err) {
         console.warn('Error flushing candidate:', err);
       }
     }
 
-    // Listen for Monitor's WebRTC Answer & Candidates via SSE
-    signaling.subscribeToRoom(newRoomCode, {
-      onAnswer: async (data) => {
-        if (data?.answer && !isRemoteDescriptionSetRef.current && pc.signalingState !== 'stable') {
-          try {
-            const answer = new RTCSessionDescription(data.answer);
-            await pc.setRemoteDescription(answer);
-            isRemoteDescriptionSetRef.current = true;
-            setIsMonitorConnected(true);
-
-            // Flush queued candidates
-            while (candidateQueueRef.current.length > 0) {
-              const cand = candidateQueueRef.current.shift();
-              if (cand) {
-                try {
-                  await pc.addIceCandidate(new RTCIceCandidate(cand));
-                } catch (e) {
-                  console.warn('Error adding queued candidate:', e);
-                }
-              }
-            }
-          } catch (err) {
-            console.error('Error setting remote description from answer:', err);
-          }
-        }
-      },
-      onMonitorCandidate: async (candidateData) => {
-        if (isRemoteDescriptionSetRef.current && pc.remoteDescription) {
-          try {
-            await pc.addIceCandidate(new RTCIceCandidate(candidateData));
-          } catch (err) {
-            console.warn('Error adding monitor candidate:', err);
-          }
-        } else {
-          candidateQueueRef.current.push(candidateData);
-        }
-      },
-    });
-
-    // Start lightweight continuous frame sync
+    // Start continuous fast frame sync loop
     startFrameStreamingLoop();
 
     setIsVirtualMode(isVirtual);

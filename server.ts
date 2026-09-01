@@ -1,7 +1,9 @@
 import express from 'express';
+import http from 'http';
 import path from 'path';
 import crypto from 'crypto';
 import fs from 'fs';
+import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
 
 interface User {
@@ -16,7 +18,7 @@ interface Room {
   id: string;
   controllerId: string;
   controllerName: string;
-  offer: any;
+  offer?: any;
   answer?: any;
   controllerCandidates: any[];
   monitorCandidates: any[];
@@ -27,9 +29,16 @@ interface Room {
   updatedAt: number;
 }
 
+interface WsClientInfo {
+  ws: WebSocket;
+  roomId?: string;
+  role?: 'controller' | 'monitor';
+}
+
 const users = new Map<string, User>();
 const rooms = new Map<string, Room>();
 const sseClients = new Map<string, express.Response[]>();
+const wsRooms = new Map<string, Set<WsClientInfo>>();
 
 // Hash password helper
 function hashPassword(password: string): string {
@@ -43,11 +52,28 @@ setInterval(() => {
     if (now - room.updatedAt > 60 * 60 * 1000) {
       rooms.delete(id);
       sseClients.delete(id);
+      wsRooms.delete(id);
     }
   }
 }, 60000);
 
+function broadcastToWsRoom(roomId: string, message: any, excludeWs?: WebSocket) {
+  const clients = wsRooms.get(roomId);
+  if (!clients) return;
+  const payload = JSON.stringify(message);
+  for (const client of clients) {
+    if (client.ws !== excludeWs && client.ws.readyState === WebSocket.OPEN) {
+      try {
+        client.ws.send(payload);
+      } catch (err) {
+        console.warn('WS send error:', err);
+      }
+    }
+  }
+}
+
 function broadcastToRoom(roomId: string, eventType: string, data: any) {
+  // Broadcast to SSE clients
   const clients = sseClients.get(roomId) || [];
   const payload = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
   for (let i = clients.length - 1; i >= 0; i--) {
@@ -61,6 +87,9 @@ function broadcastToRoom(roomId: string, eventType: string, data: any) {
       clients.splice(i, 1);
     }
   }
+
+  // Also broadcast to WebSocket clients
+  broadcastToWsRoom(roomId, { type: eventType, ...data });
 }
 
 async function startServer() {
@@ -355,8 +384,155 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  const server = http.createServer(app);
+
+  // WebSocket Server for zero-latency video frame streaming & signaling
+  const wss = new WebSocketServer({ server, path: '/ws' });
+
+  wss.on('connection', (ws: WebSocket) => {
+    let currentRoomId: string | null = null;
+    let clientRole: 'controller' | 'monitor' | null = null;
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        const { type, roomId } = msg;
+
+        if (type === 'join' && roomId) {
+          currentRoomId = roomId;
+          clientRole = msg.role || 'monitor';
+
+          if (!wsRooms.has(roomId)) {
+            wsRooms.set(roomId, new Set());
+          }
+          wsRooms.get(roomId)!.add({ ws, roomId, role: clientRole });
+
+          // If room exists, provide instant state to newly joined monitor
+          const room = rooms.get(roomId);
+          if (room) {
+            if (clientRole === 'monitor') {
+              // Send current room metadata and latest cached frame immediately
+              ws.send(
+                JSON.stringify({
+                  type: 'init',
+                  room: {
+                    id: room.id,
+                    status: room.status,
+                    cameraName: room.cameraName,
+                    offer: room.offer,
+                    controllerCandidates: room.controllerCandidates,
+                  },
+                })
+              );
+
+              if (room.lastFrame) {
+                ws.send(
+                  JSON.stringify({
+                    type: 'frame',
+                    frame: room.lastFrame,
+                    cameraName: room.cameraName,
+                  })
+                );
+              }
+
+              // Notify controller that a monitor is online
+              broadcastToWsRoom(roomId, { type: 'monitorJoined', monitorId: msg.meta?.uid || 'monitor' }, ws);
+            }
+          }
+          return;
+        }
+
+        if (type === 'frame' && roomId && msg.frame) {
+          const room = rooms.get(roomId);
+          if (room) {
+            room.lastFrame = msg.frame;
+            room.updatedAt = Date.now();
+          }
+          // Immediately broadcast frame to all monitors in this room
+          broadcastToWsRoom(roomId, { type: 'frame', frame: msg.frame, cameraName: msg.cameraName }, ws);
+          return;
+        }
+
+        if (type === 'offer' && roomId && msg.offer) {
+          const room = rooms.get(roomId);
+          if (room) {
+            room.offer = msg.offer;
+            room.updatedAt = Date.now();
+          }
+          broadcastToWsRoom(roomId, { type: 'offer', offer: msg.offer }, ws);
+          return;
+        }
+
+        if (type === 'answer' && roomId && msg.answer) {
+          const room = rooms.get(roomId);
+          if (room) {
+            room.answer = msg.answer;
+            room.status = 'connected';
+            room.updatedAt = Date.now();
+          }
+          broadcastToWsRoom(roomId, { type: 'answer', answer: msg.answer, monitorId: msg.monitorId }, ws);
+          return;
+        }
+
+        if (type === 'candidate' && roomId && msg.candidate) {
+          const room = rooms.get(roomId);
+          if (room) {
+            if (msg.role === 'controller') {
+              room.controllerCandidates.push(msg.candidate);
+            } else {
+              room.monitorCandidates.push(msg.candidate);
+            }
+          }
+          broadcastToWsRoom(
+            roomId,
+            {
+              type: msg.role === 'controller' ? 'controllerCandidate' : 'monitorCandidate',
+              candidate: msg.candidate,
+            },
+            ws
+          );
+          return;
+        }
+
+        if (type === 'control' && roomId) {
+          // Forward remote camera controls (e.g. torch, switch camera, siren alarm)
+          broadcastToWsRoom(roomId, { type: 'control', command: msg.command, value: msg.value }, ws);
+          return;
+        }
+
+        if (type === 'ping') {
+          ws.send(JSON.stringify({ type: 'pong', time: Date.now() }));
+          return;
+        }
+      } catch (err) {
+        console.warn('WS message parse error:', err);
+      }
+    });
+
+    ws.on('close', () => {
+      if (currentRoomId && wsRooms.has(currentRoomId)) {
+        const clientSet = wsRooms.get(currentRoomId)!;
+        for (const item of clientSet) {
+          if (item.ws === ws) {
+            clientSet.delete(item);
+            break;
+          }
+        }
+        if (clientSet.size === 0) {
+          wsRooms.delete(currentRoomId);
+        } else if (clientRole === 'controller') {
+          broadcastToWsRoom(currentRoomId, { type: 'disconnected' });
+        }
+      }
+    });
+
+    ws.on('error', (err) => {
+      console.warn('WS socket error:', err);
+    });
+  });
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on http://0.0.0.0:${PORT} with WebSocket support`);
   });
 }
 
