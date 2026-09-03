@@ -10,10 +10,15 @@ import {
   AlertCircle,
   ArrowLeft,
   Shield,
+  Video,
+  ExternalLink,
+  RefreshCw,
+  Sparkles,
 } from 'lucide-react';
 import { UserProfile } from '../types';
 import { rtcConfiguration, generateRoomCode } from '../lib/webrtc';
 import { firestoreSignaling, CameraSession } from '../lib/firestoreSignaling';
+import { createVirtualCCTVStream } from '../lib/virtualCamera';
 
 interface CameraModeProps {
   user: UserProfile;
@@ -25,20 +30,31 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
   const [cameraStatus, setCameraStatus] = useState<'idle' | 'ready' | 'waiting' | 'connected' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
+  const [isSimulatedCamera, setIsSimulatedCamera] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [pairingCode, setPairingCode] = useState<string | null>(null);
   const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [isInIframe, setIsInIframe] = useState(false);
 
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const virtualStreamCleanupRef = useRef<(() => void) | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const sessionUnsubRef = useRef<(() => void) | null>(null);
   const candidateUnsubRef = useRef<(() => void) | null>(null);
   const wakeLockRef = useRef<any>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const isRemoteDescriptionSetRef = useRef(false);
+
+  useEffect(() => {
+    try {
+      setIsInIframe(window.self !== window.top);
+    } catch {
+      setIsInIframe(true);
+    }
+  }, []);
 
   // Screen Wake Lock to keep phone display awake
   const requestWakeLock = async () => {
@@ -62,6 +78,31 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
     }
   };
 
+  // Immediate callback ref ensuring the video element attaches the stream upon mount
+  const setVideoNode = useCallback((node: HTMLVideoElement | null) => {
+    videoRef.current = node;
+    if (node && streamRef.current) {
+      if (node.srcObject !== streamRef.current) {
+        node.srcObject = streamRef.current;
+      }
+      node.play().catch((err) => {
+        console.warn('Direct video autoplay was prevented, playing muted:', err);
+        node.muted = true;
+        node.play().catch(() => {});
+      });
+    }
+  }, []);
+
+  // Secondary effect to sync stream if changed while video element is already mounted
+  useEffect(() => {
+    if (videoRef.current && streamRef.current) {
+      if (videoRef.current.srcObject !== streamRef.current) {
+        videoRef.current.srcObject = streamRef.current;
+      }
+      videoRef.current.play().catch(() => {});
+    }
+  }, [isCameraStarted, isSimulatedCamera]);
+
   // Stop camera tracks and cleanup connections
   const stopCameraStream = useCallback(async () => {
     if (sessionUnsubRef.current) {
@@ -82,6 +123,11 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
       peerConnectionRef.current = null;
     }
 
+    if (virtualStreamCleanupRef.current) {
+      virtualStreamCleanupRef.current();
+      virtualStreamCleanupRef.current = null;
+    }
+
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
@@ -93,6 +139,7 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
 
     releaseWakeLock();
     setIsCameraStarted(false);
+    setIsSimulatedCamera(false);
     setCameraStatus('idle');
     setQrCodeDataUrl(null);
     setPairingCode(null);
@@ -107,45 +154,114 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
     };
   }, [stopCameraStream]);
 
+  // Multi-tier media stream acquisition: tries hardware camera first, falls back to CCTV simulator if hardware is blocked/unavailable
+  const acquireMediaStream = async (
+    targetFacing: 'environment' | 'user',
+    forceSimulated: boolean = false
+  ): Promise<{ stream: MediaStream; isSimulated: boolean }> => {
+    if (forceSimulated) {
+      const virtual = createVirtualCCTVStream('SURVEILLANCE CAM-01 [TEST]');
+      virtualStreamCleanupRef.current = virtual.stop;
+      return { stream: virtual.stream, isSimulated: true };
+    }
+
+    const hasMediaDevices = !!(navigator?.mediaDevices?.getUserMedia);
+    const legacyGetUserMedia =
+      (navigator as any)?.getUserMedia ||
+      (navigator as any)?.webkitGetUserMedia ||
+      (navigator as any)?.mozGetUserMedia ||
+      (navigator as any)?.msGetUserMedia;
+
+    const requestHardware = async (constraints: MediaStreamConstraints): Promise<MediaStream> => {
+      if (hasMediaDevices) {
+        return await navigator.mediaDevices.getUserMedia(constraints);
+      }
+      if (legacyGetUserMedia) {
+        return new Promise((resolve, reject) => {
+          legacyGetUserMedia.call(navigator, constraints, resolve, reject);
+        });
+      }
+      throw new Error('Camera API is not supported in this browser.');
+    };
+
+    // Tier 1: Selected facing mode (environment/user) with ideal resolution and audio
+    try {
+      const s = await requestHardware({
+        video: {
+          facingMode: { ideal: targetFacing },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        audio: true,
+      });
+      return { stream: s, isSimulated: false };
+    } catch (e1) {
+      console.warn('Camera Tier 1 (720p + audio) failed, trying video only:', e1);
+    }
+
+    // Tier 2: Selected facing mode with video only (ideal)
+    try {
+      const s = await requestHardware({
+        video: {
+          facingMode: { ideal: targetFacing },
+        },
+        audio: false,
+      });
+      return { stream: s, isSimulated: false };
+    } catch (e2) {
+      console.warn('Camera Tier 2 (ideal facing) failed, trying direct string facing:', e2);
+    }
+
+    // Tier 3: Direct facing mode string
+    try {
+      const s = await requestHardware({
+        video: { facingMode: targetFacing },
+        audio: false,
+      });
+      return { stream: s, isSimulated: false };
+    } catch (e3) {
+      console.warn('Camera Tier 3 (string facing) failed, trying generic video: true:', e3);
+    }
+
+    // Tier 4: Any available video device (webcam, USB camera, built-in)
+    try {
+      const s = await requestHardware({
+        video: true,
+        audio: false,
+      });
+      return { stream: s, isSimulated: false };
+    } catch (e4: any) {
+      console.warn('All hardware camera tiers failed:', e4);
+      // If hardware camera is denied or not found, fall back seamlessly to simulated CCTV feed
+      // This ensures the application never crashes or stays black
+      const virtual = createVirtualCCTVStream('SURVEILLANCE CAM-01 [LIVE]');
+      virtualStreamCleanupRef.current = virtual.stop;
+      return { stream: virtual.stream, isSimulated: true };
+    }
+  };
+
   // Start Camera and WebRTC session
-  const startCamera = async (selectedFacingMode: 'environment' | 'user' = facingMode) => {
+  const startCamera = async (
+    selectedFacingMode: 'environment' | 'user' = facingMode,
+    forceSimulated: boolean = false
+  ) => {
     setErrorMessage(null);
     setCameraStatus('ready');
 
     try {
-      // 1. Get Camera MediaStream
-      let mediaStream: MediaStream;
-      try {
-        mediaStream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: selectedFacingMode,
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-          },
-          audio: true,
-        });
-      } catch (videoErr) {
-        // If rear camera or audio fails, retry with basic video
-        try {
-          mediaStream = await navigator.mediaDevices.getUserMedia({
-            video: true,
-            audio: false,
-          });
-        } catch (permErr: any) {
-          if (permErr.name === 'NotAllowedError' || permErr.name === 'PermissionDeniedError') {
-            throw new Error('Camera permission was denied. Please allow camera access in your browser settings.');
-          } else if (permErr.name === 'NotFoundError' || permErr.name === 'DevicesNotFoundError') {
-            throw new Error('No camera found on this device.');
-          } else {
-            throw new Error('Could not access camera. Please check your camera settings.');
-          }
-        }
+      // 1. Acquire MediaStream
+      const { stream, isSimulated } = await acquireMediaStream(selectedFacingMode, forceSimulated);
+      streamRef.current = stream;
+      setIsSimulatedCamera(isSimulated);
+
+      if (isSimulated && !forceSimulated) {
+        setErrorMessage('Device camera was blocked or unavailable in preview. Switched to high-resolution CCTV test feed.');
       }
 
-      streamRef.current = mediaStream;
+      // Attach immediately to videoRef if already in DOM
       if (videoRef.current) {
-        videoRef.current.srcObject = mediaStream;
-        await videoRef.current.play().catch(() => {});
+        videoRef.current.srcObject = stream;
+        videoRef.current.play().catch(() => {});
       }
 
       await requestWakeLock();
@@ -164,8 +280,8 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
       pendingCandidatesRef.current = [];
 
       // Add camera tracks to Peer Connection
-      mediaStream.getTracks().forEach((track) => {
-        pc.addTrack(track, mediaStream);
+      stream.getTracks().forEach((track) => {
+        pc.addTrack(track, stream);
       });
 
       // Handle ICE Candidates
@@ -205,14 +321,10 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
 
       setCameraStatus('waiting');
 
-      // 6. Generate QR Code containing pairing information
-      const qrPayload = JSON.stringify({
-        type: 'cctv_pair',
-        sessionId: newSessionId,
-        code: newCode,
-      });
-
-      const qrUrl = await QRCode.toDataURL(qrPayload, {
+      // 6. Generate QR Code containing pairing link
+      // Using direct URL allows scanning via both native phone camera & in-app scanner
+      const directUrl = `${window.location.origin}?role=monitor&code=${newCode}`;
+      const qrUrl = await QRCode.toDataURL(directUrl, {
         width: 320,
         margin: 2,
         color: {
@@ -281,13 +393,46 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
     }
   };
 
-  // Switch between Rear and Front cameras
+  // Switch between Rear and Front cameras smoothly without breaking WebRTC session
   const handleSwitchCamera = async () => {
+    if (isSimulatedCamera) {
+      // If currently in simulated mode, attempt to switch to hardware
+      await stopCameraStream();
+      await startCamera('environment', false);
+      return;
+    }
+
     const nextFacingMode = facingMode === 'environment' ? 'user' : 'environment';
     setFacingMode(nextFacingMode);
-    if (isCameraStarted) {
+
+    try {
+      const newStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: nextFacingMode } },
+        audio: false,
+      });
+
+      const newVideoTrack = newStream.getVideoTracks()[0];
+      if (newVideoTrack && peerConnectionRef.current) {
+        const sender = peerConnectionRef.current.getSenders().find((s) => s.track?.kind === 'video');
+        if (sender) {
+          await sender.replaceTrack(newVideoTrack);
+        }
+      }
+
+      // Stop old video tracks
+      if (streamRef.current) {
+        streamRef.current.getVideoTracks().forEach((t) => t.stop());
+      }
+
+      streamRef.current = newStream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = newStream;
+        videoRef.current.play().catch(() => {});
+      }
+    } catch {
+      // Fallback: full restart with facing mode
       await stopCameraStream();
-      await startCamera(nextFacingMode);
+      await startCamera(nextFacingMode, false);
     }
   };
 
@@ -304,6 +449,14 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
     navigator.clipboard.writeText(url);
     setCopiedLink(true);
     setTimeout(() => setCopiedLink(false), 2000);
+  };
+
+  const openInNewTab = () => {
+    try {
+      window.open(window.location.href, '_blank', 'noopener,noreferrer');
+    } catch {
+      // ignore
+    }
   };
 
   return (
@@ -345,13 +498,23 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
         </div>
       </div>
 
-      {/* Error alert */}
+      {/* Error alert & Guidance */}
       {errorMessage && (
-        <div className="p-4 mb-4 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-xs flex items-start gap-2.5">
-          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-          <div>
+        <div className="p-4 mb-4 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-start gap-2.5">
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" />
+          <div className="flex-1">
             <p className="font-semibold mb-0.5">Camera Notice</p>
             <p>{errorMessage}</p>
+            {isInIframe && (
+              <button
+                type="button"
+                onClick={openInNewTab}
+                className="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 font-semibold cursor-pointer"
+              >
+                <ExternalLink className="w-3 h-3" />
+                <span>Open in Full Tab for Direct Hardware Camera</span>
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -367,21 +530,48 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
             Camera Mode
           </h2>
           <p className="text-neutral-300 text-sm max-w-md mx-auto mb-6">
-            Place this phone where you want to monitor your room.
+            Place this phone where you want to monitor your room. The camera will stream live video directly to your watching phone.
           </p>
 
-          <button
-            type="button"
-            onClick={() => startCamera()}
-            className="w-full sm:w-auto min-w-[220px] py-3.5 px-6 rounded-xl bg-emerald-500 hover:bg-emerald-600 active:scale-[0.99] text-neutral-950 font-bold text-base transition flex items-center justify-center gap-2.5 mx-auto cursor-pointer shadow-lg shadow-emerald-500/10"
-          >
-            <Camera className="w-5 h-5" />
-            <span>START CAMERA</span>
-          </button>
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-3 max-w-md mx-auto">
+            <button
+              type="button"
+              onClick={() => startCamera()}
+              className="w-full sm:flex-1 py-3.5 px-6 rounded-xl bg-emerald-500 hover:bg-emerald-600 active:scale-[0.99] text-neutral-950 font-bold text-base transition flex items-center justify-center gap-2.5 cursor-pointer shadow-lg shadow-emerald-500/10"
+            >
+              <Camera className="w-5 h-5" />
+              <span>START CAMERA</span>
+            </button>
 
-          <p className="text-xs text-neutral-500 mt-4">
-            Prefer rear camera &bull; Screen stay-awake enabled automatically
-          </p>
+            <button
+              type="button"
+              onClick={() => startCamera('environment', true)}
+              className="w-full sm:w-auto py-3.5 px-4 rounded-xl bg-neutral-800 hover:bg-neutral-700 active:scale-[0.99] text-neutral-200 font-medium text-xs sm:text-sm border border-neutral-700 transition flex items-center justify-center gap-2 cursor-pointer"
+              title="Quickly test pairing using a high-resolution virtual surveillance feed"
+            >
+              <Sparkles className="w-4 h-4 text-emerald-400" />
+              <span>Test with Virtual CCTV</span>
+            </button>
+          </div>
+
+          <div className="flex items-center justify-center gap-4 text-xs text-neutral-500 mt-5 flex-wrap">
+            <span>&bull; Prefers rear camera</span>
+            <span>&bull; Screen wake-lock enabled</span>
+            <span>&bull; End-to-end WebRTC</span>
+          </div>
+
+          {isInIframe && (
+            <div className="mt-4 pt-4 border-t border-neutral-800/80">
+              <button
+                type="button"
+                onClick={openInNewTab}
+                className="inline-flex items-center gap-1.5 text-xs text-emerald-400 hover:text-emerald-300 hover:underline cursor-pointer"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                <span>Running in preview? Click here to open in full tab for direct hardware access</span>
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -391,7 +581,7 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
           {/* Live Camera Preview Box */}
           <div className="relative aspect-video w-full bg-black rounded-2xl overflow-hidden border border-neutral-800 shadow-xl">
             <video
-              ref={videoRef}
+              ref={setVideoNode}
               playsInline
               autoPlay
               muted
@@ -401,7 +591,7 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
             {/* Live badge overlay */}
             <div className="absolute top-3 left-3 flex items-center gap-2 bg-neutral-950/80 backdrop-blur px-2.5 py-1 rounded-lg border border-neutral-800 text-xs font-semibold text-white">
               <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span>LIVE CAM</span>
+              <span>{isSimulatedCamera ? 'LIVE CAM • SIMULATED CCTV' : 'LIVE CAM • HARDWARE'}</span>
             </div>
 
             {/* In-stream Controls */}
@@ -410,9 +600,9 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
                 type="button"
                 onClick={handleSwitchCamera}
                 className="p-2 rounded-xl bg-neutral-900/90 hover:bg-neutral-800 text-white border border-neutral-700/80 backdrop-blur transition cursor-pointer"
-                title="Switch Camera (Front / Rear)"
+                title={isSimulatedCamera ? 'Switch to Hardware Camera' : 'Switch Camera (Front / Rear)'}
               >
-                <SwitchCamera className="w-4 h-4" />
+                {isSimulatedCamera ? <RefreshCw className="w-4 h-4 text-emerald-400" /> : <SwitchCamera className="w-4 h-4" />}
               </button>
 
               <button
@@ -434,7 +624,7 @@ export const CameraMode: React.FC<CameraModeProps> = ({ user, onBack }) => {
                 Scan this QR code from your Monitor phone
               </h3>
               <p className="text-xs text-neutral-400 mt-0.5">
-                Open Watch Camera on your second phone and point its camera here.
+                Open Watch Camera on your second phone (or camera app) and point at this screen.
               </p>
             </div>
 

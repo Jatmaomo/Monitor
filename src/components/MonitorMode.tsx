@@ -12,6 +12,7 @@ import {
   Volume2,
   VolumeX,
   Maximize2,
+  ExternalLink,
 } from 'lucide-react';
 import { UserProfile } from '../types';
 import { rtcConfiguration } from '../lib/webrtc';
@@ -32,10 +33,12 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [isAudioMuted, setIsAudioMuted] = useState(true);
   const [isScanningQR, setIsScanningQR] = useState(false);
+  const [isInIframe, setIsInIframe] = useState(false);
 
   // Video and WebRTC refs
-  const remoteVideoRef = useRef<HTMLVideoElement>(null);
-  const qrScannerVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
+  const qrScannerVideoRef = useRef<HTMLVideoElement | null>(null);
   const qrScannerStreamRef = useRef<MediaStream | null>(null);
   const qrScanAnimFrameRef = useRef<number | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
@@ -43,6 +46,54 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
   const candidateUnsubRef = useRef<(() => void) | null>(null);
   const isRemoteDescriptionSetRef = useRef(false);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+
+  useEffect(() => {
+    try {
+      setIsInIframe(window.self !== window.top);
+    } catch {
+      setIsInIframe(true);
+    }
+  }, []);
+
+  // Callback ref for remote video: instantly attaches stream upon mount
+  const setRemoteVideoNode = useCallback((node: HTMLVideoElement | null) => {
+    remoteVideoRef.current = node;
+    if (node && remoteStreamRef.current) {
+      if (node.srcObject !== remoteStreamRef.current) {
+        node.srcObject = remoteStreamRef.current;
+      }
+      node.play().catch((err) => {
+        console.warn('Remote video playback muted retry:', err);
+        node.muted = true;
+        node.play().catch(() => {});
+      });
+    }
+  }, []);
+
+  // Sync stream to remote video ref whenever connection state updates
+  useEffect(() => {
+    if (remoteVideoRef.current && remoteStreamRef.current) {
+      if (remoteVideoRef.current.srcObject !== remoteStreamRef.current) {
+        remoteVideoRef.current.srcObject = remoteStreamRef.current;
+      }
+      remoteVideoRef.current.play().catch(() => {});
+    }
+  }, [connectionStatus]);
+
+  // Callback ref for QR scanner video element
+  const setQrScannerVideoNode = useCallback((node: HTMLVideoElement | null) => {
+    qrScannerVideoRef.current = node;
+    if (node && qrScannerStreamRef.current) {
+      if (node.srcObject !== qrScannerStreamRef.current) {
+        node.srcObject = qrScannerStreamRef.current;
+      }
+      node.play().then(() => {
+        scanQRCodeFrame();
+      }).catch(() => {
+        scanQRCodeFrame();
+      });
+    }
+  }, []);
 
   // Disconnect & cleanup
   const disconnectSession = useCallback(async () => {
@@ -65,6 +116,7 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
     if (remoteVideoRef.current) {
       remoteVideoRef.current.srcObject = null;
     }
+    remoteStreamRef.current = null;
 
     if (activeSessionId) {
       await firestoreSignaling.closeSession(activeSessionId);
@@ -90,7 +142,7 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
 
     try {
       if (!targetSession.offer) {
-        throw new Error('Camera session has no valid video offer.');
+        throw new Error('Camera session has no active video stream.');
       }
 
       setActiveSessionId(targetSession.sessionId);
@@ -103,9 +155,12 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
 
       // Receive remote tracks (video & audio)
       pc.ontrack = (event) => {
-        if (remoteVideoRef.current && event.streams[0]) {
-          remoteVideoRef.current.srcObject = event.streams[0];
-          remoteVideoRef.current.play().catch(() => {});
+        if (event.streams[0]) {
+          remoteStreamRef.current = event.streams[0];
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = event.streams[0];
+            remoteVideoRef.current.play().catch(() => {});
+          }
           setConnectionStatus('connected');
         }
       };
@@ -167,27 +222,47 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
         }
       );
 
-      // 6. Listen for Camera status changes
+      // 6. Listen for Camera session status changes (e.g. Camera stops)
       sessionUnsubRef.current = firestoreSignaling.subscribeToSession(
         targetSession.sessionId,
-        (updatedSession) => {
-          if (updatedSession.status === 'disconnected') {
+        (sessionData: CameraSession) => {
+          if (sessionData.status === 'disconnected') {
             setConnectionStatus('lost');
           }
         }
       );
     } catch (err: any) {
-      console.error('Connection error:', err);
-      setErrorMessage(err.message || 'Unable to connect to camera.');
+      console.error('WebRTC connect error:', err);
+      setErrorMessage(err.message || 'Failed to connect to camera phone.');
       setConnectionStatus('error');
     }
   };
 
-  // Connect via 6-digit backup code
+  // Helper to extract code from raw string or full URL
+  const extractCode = (raw: string): string => {
+    const trimmed = raw.trim();
+    if (trimmed.includes('code=')) {
+      try {
+        const url = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
+        const c = url.searchParams.get('code') || url.searchParams.get('room');
+        if (c) return c.replace(/\D/g, '');
+      } catch {
+        // fallback regex
+        const match = trimmed.match(/code=(\d{6})/);
+        if (match) return match[1];
+      }
+    }
+    return trimmed.replace(/\D/g, '');
+  };
+
+  // Connect using manual 6-digit code
   const handleManualCodeSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanCode = manualCode.trim();
-    if (!cleanCode) return;
+    const cleanCode = extractCode(manualCode);
+    if (!cleanCode || cleanCode.length !== 6) {
+      setErrorMessage('Please enter a valid 6-digit code.');
+      return;
+    }
 
     setErrorMessage(null);
     setConnectionStatus('connecting');
@@ -195,12 +270,12 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
     try {
       const session = await firestoreSignaling.findSessionByCode(cleanCode);
       if (!session) {
-        throw new Error('Camera session not found or code expired. Please check the code.');
+        throw new Error(`No active camera found with code ${cleanCode}. Please check the code.`);
       }
       await connectToSession(session);
     } catch (err: any) {
       console.error('Manual code lookup error:', err);
-      setErrorMessage(err.message || 'Invalid backup code.');
+      setErrorMessage(err.message || 'Invalid code or camera session expired.');
       setConnectionStatus('error');
     }
   };
@@ -208,11 +283,14 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
   // Auto-connect if initialCode was passed in URL query
   useEffect(() => {
     if (initialCode && connectionStatus === 'idle') {
-      firestoreSignaling.findSessionByCode(initialCode).then((session) => {
-        if (session) {
-          connectToSession(session);
-        }
-      });
+      const clean = extractCode(initialCode);
+      if (clean.length === 6) {
+        firestoreSignaling.findSessionByCode(clean).then((session) => {
+          if (session) {
+            connectToSession(session);
+          }
+        });
+      }
     }
   }, [initialCode]);
 
@@ -223,10 +301,18 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
     setConnectionStatus('scanning');
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' },
-        audio: false,
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: 'environment' } },
+          audio: false,
+        });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        });
+      }
 
       qrScannerStreamRef.current = stream;
 
@@ -237,7 +323,7 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
       }
     } catch (err: any) {
       console.error('QR scanner camera error:', err);
-      setErrorMessage('Could not access camera for QR scanning. You can enter the backup code manually.');
+      setErrorMessage('Could not open camera for QR scanning. You can enter the 6-digit code below.');
       setIsScanningQR(false);
       setConnectionStatus('idle');
     }
@@ -276,8 +362,24 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
         });
 
         if (code && code.data) {
+          const rawData = code.data.trim();
+
+          // 1. Direct URL format
+          if (rawData.includes('code=')) {
+            const extracted = extractCode(rawData);
+            if (extracted.length === 6) {
+              stopQRScanner();
+              firestoreSignaling.findSessionByCode(extracted).then((session) => {
+                if (session) connectToSession(session);
+                else setErrorMessage('Camera session not found for this QR code.');
+              });
+              return;
+            }
+          }
+
+          // 2. JSON format
           try {
-            const parsed = JSON.parse(code.data);
+            const parsed = JSON.parse(rawData);
             if (parsed && (parsed.sessionId || parsed.code)) {
               stopQRScanner();
               if (parsed.sessionId) {
@@ -300,16 +402,18 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
               return;
             }
           } catch {
-            // Check if raw data is 6-digit code
-            const raw = code.data.trim();
-            if (/^\d{6}$/.test(raw)) {
-              stopQRScanner();
-              firestoreSignaling.findSessionByCode(raw).then((session) => {
-                if (session) connectToSession(session);
-                else setErrorMessage('Camera code not found.');
-              });
-              return;
-            }
+            // Not JSON
+          }
+
+          // 3. Raw 6-digit code
+          const rawClean = rawData.replace(/\D/g, '');
+          if (rawClean.length === 6) {
+            stopQRScanner();
+            firestoreSignaling.findSessionByCode(rawClean).then((session) => {
+              if (session) connectToSession(session);
+              else setErrorMessage('Camera session not found.');
+            });
+            return;
           }
         }
       }
@@ -326,6 +430,14 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
       remoteVideoRef.current.requestFullscreen().catch(() => {});
     } else {
       document.exitFullscreen().catch(() => {});
+    }
+  };
+
+  const openInNewTab = () => {
+    try {
+      window.open(window.location.href, '_blank', 'noopener,noreferrer');
+    } catch {
+      // ignore
     }
   };
 
@@ -372,9 +484,19 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
       {errorMessage && (
         <div className="p-4 mb-4 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-xs flex items-start gap-2.5">
           <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-          <div>
+          <div className="flex-1">
             <p className="font-semibold mb-0.5">Monitor Notice</p>
             <p>{errorMessage}</p>
+            {isInIframe && (
+              <button
+                type="button"
+                onClick={openInNewTab}
+                className="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-200 font-semibold cursor-pointer"
+              >
+                <ExternalLink className="w-3 h-3" />
+                <span>Open in New Tab</span>
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -384,7 +506,7 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
         <div className="space-y-4">
           <div className="relative aspect-video w-full bg-black rounded-2xl overflow-hidden border border-neutral-800 shadow-2xl">
             <video
-              ref={remoteVideoRef}
+              ref={setRemoteVideoNode}
               playsInline
               autoPlay
               muted={isAudioMuted}
@@ -455,8 +577,9 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
             <button
               type="button"
               onClick={() => {
-                if (manualCode) {
-                  firestoreSignaling.findSessionByCode(manualCode).then((s) => {
+                const clean = extractCode(manualCode);
+                if (clean.length === 6) {
+                  firestoreSignaling.findSessionByCode(clean).then((s) => {
                     if (s) connectToSession(s);
                   });
                 } else {
@@ -500,7 +623,7 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
               <div className="mb-4">
                 <div className="relative aspect-square max-w-[280px] mx-auto rounded-2xl overflow-hidden border-2 border-cyan-500 shadow-2xl bg-black">
                   <video
-                    ref={qrScannerVideoRef}
+                    ref={setQrScannerVideoNode}
                     playsInline
                     autoPlay
                     muted
@@ -540,23 +663,22 @@ export const MonitorMode: React.FC<MonitorModeProps> = ({ user, onBack, initialC
               </div>
               <div>
                 <h3 className="text-sm font-bold text-white">Enter Code Manually</h3>
-                <p className="text-xs text-neutral-400">If your QR scanner does not work</p>
+                <p className="text-xs text-neutral-400">If your QR scanner does not work or if you received a link</p>
               </div>
             </div>
 
             <form onSubmit={handleManualCodeSubmit} className="flex gap-2">
               <input
                 type="text"
-                maxLength={6}
-                placeholder="6-digit code (e.g. 482913)"
+                placeholder="6-digit code or paste link"
                 value={manualCode}
-                onChange={(e) => setManualCode(e.target.value.replace(/\D/g, ''))}
-                className="flex-1 px-4 py-2.5 rounded-xl bg-neutral-950 border border-neutral-800 text-neutral-100 placeholder-neutral-500 font-mono tracking-widest text-center text-base focus:outline-none focus:border-cyan-500 transition"
+                onChange={(e) => setManualCode(e.target.value)}
+                className="flex-1 px-4 py-2.5 rounded-xl bg-neutral-950 border border-neutral-800 text-neutral-100 placeholder-neutral-500 font-mono tracking-wider text-center text-sm sm:text-base focus:outline-none focus:border-cyan-500 transition"
               />
               <button
                 type="submit"
-                disabled={manualCode.length !== 6 || connectionStatus === 'connecting'}
-                className="px-5 py-2.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 disabled:opacity-40 text-white text-xs font-bold transition cursor-pointer"
+                disabled={extractCode(manualCode).length !== 6 || connectionStatus === 'connecting'}
+                className="px-5 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-600 disabled:opacity-40 text-neutral-950 text-xs font-bold transition cursor-pointer"
               >
                 {connectionStatus === 'connecting' ? 'Connecting...' : 'Connect'}
               </button>

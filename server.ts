@@ -98,6 +98,12 @@ async function startServer() {
 
   app.use(express.json({ limit: '10mb' }));
 
+  // Grant camera & microphone permissions explicitly for web/iframe embedding
+  app.use((req, res, next) => {
+    res.setHeader('Permissions-Policy', 'camera=*, microphone=*, display-capture=*');
+    next();
+  });
+
   // API Health check
   app.get('/api/health', (req, res) => {
     res.json({
