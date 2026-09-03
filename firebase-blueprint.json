@@ -12,21 +12,22 @@
       },
       "required": ["uid", "fullName", "email", "createdAt"]
     },
-    "Room": {
-      "title": "Room",
-      "description": "Active camera room pairing and WebRTC signaling session",
+    "Session": {
+      "title": "Session",
+      "description": "Camera pairing session and WebRTC signaling exchange",
       "type": "object",
       "properties": {
-        "id": { "type": "string" },
-        "controllerId": { "type": "string" },
-        "controllerName": { "type": "string" },
+        "sessionId": { "type": "string" },
+        "pairingCode": { "type": "string" },
+        "cameraUserId": { "type": "string" },
+        "monitorUserId": { "type": "string" },
         "status": { "type": "string", "enum": ["waiting", "connected", "disconnected"] },
-        "monitorId": { "type": "string" },
-        "monitorName": { "type": "string" },
+        "offer": { "type": "object" },
+        "answer": { "type": "object" },
         "createdAt": { "type": "number" },
-        "updatedAt": { "type": "number" }
+        "expiresAt": { "type": "number" }
       },
-      "required": ["id", "controllerId", "status", "createdAt", "updatedAt"]
+      "required": ["sessionId", "pairingCode", "cameraUserId", "status", "createdAt", "expiresAt"]
     }
   },
   "firestore": {
@@ -34,17 +35,17 @@
       "schema": "UserProfile",
       "description": "User profile documents keyed by Firebase Auth UID"
     },
-    "/rooms/{roomId}": {
-      "schema": "Room",
-      "description": "Camera pairing room documents keyed by 6-digit room code"
+    "/sessions/{sessionId}": {
+      "schema": "Session",
+      "description": "WebRTC camera session documents keyed by sessionId"
     },
-    "/rooms/{roomId}/controllerCandidates/{candidateId}": {
+    "/sessions/{sessionId}/cameraCandidates/{candidateId}": {
       "schema": "object",
-      "description": "WebRTC ICE candidates sent from Controller camera phone"
+      "description": "WebRTC ICE candidates sent from Camera phone"
     },
-    "/rooms/{roomId}/monitorCandidates/{candidateId}": {
+    "/sessions/{sessionId}/monitorCandidates/{candidateId}": {
       "schema": "object",
-      "description": "WebRTC ICE candidates sent from Monitor viewer phone"
+      "description": "WebRTC ICE candidates sent from Monitor phone"
     }
   }
 }

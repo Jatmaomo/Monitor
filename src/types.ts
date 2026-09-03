@@ -1,4 +1,4 @@
-export type AppRole = 'controller' | 'monitor' | null;
+export type AppRole = 'camera' | 'monitor' | null;
 
 export interface UserProfile {
   uid: string;

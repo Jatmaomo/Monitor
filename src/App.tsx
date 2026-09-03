@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { UserProfile, AppRole } from './types';
 import { Header } from './components/Header';
 import { RoleSelector } from './components/RoleSelector';
-import { ControllerMode } from './components/ControllerMode';
+import { CameraMode } from './components/CameraMode';
 import { MonitorMode } from './components/MonitorMode';
 import { Auth } from './components/Auth';
 import { ShieldCheck } from 'lucide-react';
@@ -17,14 +17,14 @@ export default function App() {
   useEffect(() => {
     try {
       const urlParams = new URLSearchParams(window.location.search);
-      const urlRoom = urlParams.get('room');
+      const urlRoom = urlParams.get('room') || urlParams.get('code');
       const urlRole = urlParams.get('role');
 
       if (urlRoom) {
         setInitialRoomCode(urlRoom.trim());
         setRole('monitor');
-      } else if (urlRole === 'controller' || urlRole === 'monitor') {
-        setRole(urlRole);
+      } else if (urlRole === 'camera' || urlRole === 'monitor') {
+        setRole(urlRole as AppRole);
       }
     } catch (e) {
       console.warn('Could not parse URL query parameters:', e);
@@ -51,7 +51,7 @@ export default function App() {
       // If user arrived via direct room code link or QR code, auto-create guest session
       try {
         const urlParams = new URLSearchParams(window.location.search);
-        if (urlParams.get('room') || urlParams.get('role')) {
+        if (urlParams.get('room') || urlParams.get('code') || urlParams.get('role')) {
           const guestUser: UserProfile = {
             uid: 'usr_' + Math.random().toString(36).substring(2, 10),
             fullName: 'Security Monitor',
@@ -83,6 +83,7 @@ export default function App() {
       const url = new URL(window.location.href);
       url.searchParams.delete('role');
       url.searchParams.delete('room');
+      url.searchParams.delete('code');
       window.history.replaceState({}, '', url.toString());
     } catch {
       // ignore
@@ -98,6 +99,7 @@ export default function App() {
       } else {
         url.searchParams.delete('role');
         url.searchParams.delete('room');
+        url.searchParams.delete('code');
       }
       window.history.replaceState({}, '', url.toString());
     } catch {
@@ -122,18 +124,21 @@ export default function App() {
     <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col selection:bg-emerald-500 selection:text-black">
       <Header
         user={user}
-        currentRole={role}
-        onSelectRole={handleRoleChange}
-        onSignOut={handleSignOut}
+        onLogout={handleSignOut}
+        onGoHome={() => handleRoleChange(null)}
       />
 
       <main className="flex-1 flex flex-col justify-center py-4">
         {!user ? (
-          <Auth onAuthSuccess={handleAuthSuccess} />
-        ) : role === 'controller' ? (
-          <ControllerMode user={user} />
+          <Auth onSuccess={handleAuthSuccess} />
+        ) : role === 'camera' ? (
+          <CameraMode user={user} onBack={() => handleRoleChange(null)} />
         ) : role === 'monitor' ? (
-          <MonitorMode user={user} initialRoomCode={initialRoomCode} />
+          <MonitorMode
+            user={user}
+            onBack={() => handleRoleChange(null)}
+            initialCode={initialRoomCode}
+          />
         ) : (
           <RoleSelector user={user} onSelectRole={handleRoleChange} />
         )}
